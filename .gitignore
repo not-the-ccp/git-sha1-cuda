@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Generated CUDA jobs, executables, disassembly, and benchmark captures.
+build/
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+*.o
+
