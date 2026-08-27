@@ -1,0 +1,5 @@
+round_form,g,v,block,cache,stride,outer_count,launches,samples,median_ghs,min_ghs,max_ghs,prod_regs,prod_local_bytes,dynamic_smem_bytes,exact_digests
+struct,2,8,256,ca,65,4194304,4,9,10.933543,10.838191,11.071030,96,0,33280,12
+struct,2,8,192,ca,65,4194304,4,9,10.910506,10.800848,10.994042,96,0,24960,12
+struct,2,8,128,ca,65,4194304,4,9,10.907754,10.754570,10.974338,96,0,16640,12
+struct,2,8,64,ca,65,4194304,4,9,10.873396,10.814466,10.961947,96,0,8320,12

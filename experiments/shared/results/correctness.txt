@@ -1,0 +1,15 @@
+CUDA 13.3.1, sm_89, NVIDIA GeForce RTX 4060
+Every row in rtx4060-survey.csv and rtx4060-confirmation.csv passed 12/12
+exact 160-bit digest comparisons (three W12 outer words times four W13 bytes).
+
+Representative capture, struct-g4-v4-b96-ca-s65:
+
+DIGEST outer=01020304 inner=00 gpu=ba11a757e497e6d20c25a1d6454ad524bcdbd7bf cpu=ba11a757e497e6d20c25a1d6454ad524bcdbd7bf
+DIGEST outer=01020304 inner=05 gpu=d51c9e973777e7dc2a725afe1b5284b38ecba77f cpu=d51c9e973777e7dc2a725afe1b5284b38ecba77f
+DIGEST outer=01020304 inner=7f gpu=02fdfb4fb11cbb6542840e53b58dd7e84ab8c8d0 cpu=02fdfb4fb11cbb6542840e53b58dd7e84ab8c8d0
+DIGEST outer=01020304 inner=ff gpu=c0ed4caea3bbe4b6299c237d882046413b65484a cpu=c0ed4caea3bbe4b6299c237d882046413b65484a
+CORRECT variant=struct-g4-v4-b96-ca-s65 exact_digests=12
+
+The 0102030405 digest is additionally embedded by generate.py from Python
+hashlib over the complete `commit <length>\0<payload>` object. This catches a
+shared CPU/GPU mistake in the fixed-prefix state or Git object serialization.

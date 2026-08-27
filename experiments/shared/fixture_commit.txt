@@ -1,0 +1,6 @@
+tree 0123456789abcdef0123456789abcdef01234567
+parent 89abcdef0123456789abcdef0123456789abcdef
+author CUDA Study <cuda@example.invalid> 1787788800 +0000
+committer CUDA Study <cuda@example.invalid> 1787788800 +0000
+
+Deterministic unsigned commit used by the shared-schedule benchmark.

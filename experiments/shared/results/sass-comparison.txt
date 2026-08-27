@@ -1,0 +1,39 @@
+CUDA 13.3.1 cuobjdump, sm_89 production kernels (DIAG=false)
+
+struct G2/V8/CA/stride65:
+  3720 static SASS instructions
+  96 registers, 0 stack, 0 local memory, 0 spills
+  leading opcode counts:
+    1033 LOP3.LUT
+     960 IADD3
+     670 SHF.L.W.U32.HI
+     536 LEA.HI
+     251 LDS
+      64 STS
+      64 LDG.E.128.STRONG.SM
+
+rotating G2/V8/CA/stride65:
+  3824 static SASS instructions
+  96 registers, 0 stack, 0 local memory, 0 spills
+  leading opcode counts:
+    1050 IADD3
+    1033 LOP3.LUT
+     670 SHF.L.W.U32.HI
+     536 LEA.HI
+     251 LDS
+      64 STS
+      64 LDG.E.128.STRONG.SM
+
+The hashcat-style form adds 104 static instructions, including 90 IADD3s,
+without reducing the register footprint. This agrees with its lower measured
+rate (10.565 vs 10.886 GH/s in the controlled B128 confirmation).
+
+Artifacts:
+  best-production.sass.gz
+    SHA-256 e27b83ee29bc6945978e4c04d49b888950d666c465cea70d0a3f49ec426132e1
+  rotating-comparison.sass.gz
+    SHA-256 f4ec64f08ef62f36f5af6fb6f4f5a132d132861e17c2dc505049b4e114055442
+
+`nvdisasm -c` from CUDA 13.3.1 reports an unexpected line-info section size
+for these executables. `cuobjdump --dump-sass` successfully disassembles the
+same cubins and is therefore the recorded path.

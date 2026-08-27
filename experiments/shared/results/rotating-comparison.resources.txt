@@ -1,0 +1,38 @@
+
+Fatbin elf code:
+================
+arch = sm_89
+code version = [1,8]
+host = linux
+compile_size = 64bit
+identifier = rotating-g2-v8-b128-ca-s65.cu
+
+Resource usage:
+ Common:
+  GLOBAL:0
+
+Fatbin elf code:
+================
+arch = sm_89
+code version = [1,8]
+host = linux
+compile_size = 64bit
+identifier = rotating-g2-v8-b128-ca-s65.cu
+
+Resource usage:
+ Common:
+  GLOBAL:0
+ Function _Z13search_kernelILb0EEvmmPKjPmjPj:
+  REG:96 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:400 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _Z13search_kernelILb1EEvmmPKjPmjPj:
+  REG:83 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:400 TEXTURE:0 SURFACE:0 SAMPLER:0
+
+Fatbin ptx code:
+================
+arch = sm_89
+code version = [9,3]
+host = linux
+compile_size = 64bit
+compressed
+identifier = rotating-g2-v8-b128-ca-s65.cu
+ptxasOptions = -v  --generate-line-info

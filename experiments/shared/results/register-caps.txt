@@ -1,0 +1,14 @@
+Survey of struct G2/V8/B256/CA/stride65, 2^20 outer words, 4 launches/sample,
+7 samples. The production and diagnostic kernels are both shown by ptxas.
+
+default: production 96 regs, diagnostic 83 regs, zero spills
+         long confirmation median 10.996204 GH/s
+cap 88: production 87 regs, diagnostic 88 regs, zero spills
+        survey median 11.004513 GH/s (min 10.240600, max 11.045549)
+cap 80: production 80 regs, diagnostic 80 regs, zero spills
+        survey median 10.978014 GH/s (min 10.923463, max 11.027892)
+cap 72: production 72 regs, 176-byte stack, 184-byte spill stores,
+        404-byte spill loads; median 10.251112 GH/s
+
+The caps do not produce a repeatable improvement. The checked-in default keeps
+the compiler-selected 96-register production kernel and has zero spills.
