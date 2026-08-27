@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import random
+import subprocess
+import tempfile
+import unittest
+
+from tools.git_sha1_job import (
+    MASK32,
+    RAW_NONCE_BLOCK_OFFSET,
+    TargetPrefix,
+    block_words,
+    build_raw_tail_job,
+    candidate_nonce,
+    candidate_words,
+    h0_gate_parameters,
+    nonce_is_log_safe,
+    render_cuda_header,
+    serialize_git_commit,
+    sha1_compress,
+    sha1_compress_working,
+    sha1_digest_independent,
+    sha1_pad,
+    working_state_matches_prefix,
+    write_job,
+)
+
+
+class GitSerializationTests(unittest.TestCase):
+    def test_exact_serialization(self) -> None:
+        payload = b"tree 0123456789012345678901234567890123456789\n\nmessage\n"
+        expected = b"commit 55\0" + payload
+        self.assertEqual(serialize_git_commit(payload), expected)
+
+    def test_hashlib_matches_git_hash_object(self) -> None:
+        rng = random.Random(0x6174_6F62)
+        for size in (0, 1, 9, 10, 55, 56, 63, 64, 99, 100, 255):
+            payload = rng.randbytes(size)
+            expected = hashlib.sha1(serialize_git_commit(payload)).hexdigest()
+            result = subprocess.run(
+                ["git", "hash-object", "-t", "commit", "--stdin", "--literally"],
+                input=payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertEqual(result.stdout.strip().decode("ascii"), expected)
+
+
+class IndependentSha1Tests(unittest.TestCase):
+    def test_padding_boundaries_and_random_messages(self) -> None:
+        rng = random.Random(0x5A1_0A11)
+        sizes = list(range(0, 80)) + [111, 112, 119, 120, 127, 128, 255, 1024]
+        sizes.extend(rng.randrange(0, 4096) for _ in range(100))
+        for size in sizes:
+            message = rng.randbytes(size)
+            with self.subTest(size=size):
+                self.assertEqual(sha1_digest_independent(message), hashlib.sha1(message).digest())
+                padded = sha1_pad(message)
+                self.assertEqual(len(padded) % 64, 0)
+                self.assertEqual(int.from_bytes(padded[-8:], "big"), size * 8)
+
+
+class TargetPrefixTests(unittest.TestCase):
+    def test_partial_hex_selects_leading_bits(self) -> None:
+        target = TargetPrefix.from_hex("a8", 5)
+        self.assertEqual(target.value, 0b10101)
+        self.assertEqual(target.display_hex(), "a8")
+        self.assertEqual(target.words[0], 0xA800_0000)
+        self.assertEqual(target.masks[0], 0xF800_0000)
+
+    def test_prefix_matching_and_working_gate_all_widths(self) -> None:
+        rng = random.Random(0xC0FF_EE51)
+        for _ in range(60):
+            prestate = tuple(rng.getrandbits(32) for _ in range(5))
+            block = rng.randbytes(64)
+            working = sha1_compress_working(prestate, block)
+            digest_words = sha1_compress(prestate, block)
+            digest = b"".join(word.to_bytes(4, "big") for word in digest_words)
+            digest_int = int.from_bytes(digest, "big")
+            for bits in range(1, 161):
+                value = digest_int >> (160 - bits)
+                target = TargetPrefix(bits, value)
+                self.assertTrue(target.matches(digest))
+                self.assertTrue(working_state_matches_prefix(working, prestate, target))
+
+                bad_target = TargetPrefix(bits, value ^ 1)
+                self.assertFalse(bad_target.matches(digest))
+                self.assertFalse(working_state_matches_prefix(working, prestate, bad_target))
+
+    def test_h0_modular_interval_wraps(self) -> None:
+        target = TargetPrefix(3, 0b001)
+        prestate_h0 = 0xF000_0000
+        base, span = h0_gate_parameters(prestate_h0, target)
+        self.assertEqual(base, 0x3000_0000)
+        self.assertEqual(span, 1 << 29)
+        for offset in (0, span - 1):
+            digest_h0 = (prestate_h0 + base + offset) & MASK32
+            self.assertEqual(digest_h0 >> 29, target.value)
+
+
+class RawTailJobTests(unittest.TestCase):
+    def test_layout_invariants_across_source_lengths(self) -> None:
+        rng = random.Random(0xB10C_4A11)
+        target = TargetPrefix.from_hex("deadbeef")
+        lengths = list(range(0, 150)) + [rng.randrange(0, 8000) for _ in range(150)]
+        for size in lengths:
+            source = rng.randbytes(size)
+            job = build_raw_tail_job(source, target)
+            with self.subTest(size=size):
+                padded = sha1_pad(job.object_template)
+                self.assertEqual(job.nonce_object_offset % 64, RAW_NONCE_BLOCK_OFFSET)
+                self.assertEqual(job.mutable_block, len(padded) // 64 - 1)
+                self.assertEqual(len(job.object_template) % 64, 54)
+                self.assertEqual(job.manifest()["candidate_dependent_blocks"], 1)
+                self.assertEqual(job.final_block_template[48:53], b"\0" * 5)
+                self.assertEqual(job.final_block_template[53:55], b"\n\x80")
+                self.assertLess(job.filler_bytes, 128)
+
+    def test_candidate_mapping_digest_and_nonce_policy(self) -> None:
+        rng = random.Random(0x4B1_4E5A)
+        job = build_raw_tail_job(b"tree deadbeef\n\nexample", TargetPrefix.from_hex("12345"))
+        candidates = [0, 1, 0xAABBCCDDEE, (1 << 40) - 1]
+        candidates.extend(rng.randrange(1 << 40) for _ in range(300))
+        for candidate in candidates:
+            nonce = candidate_nonce(candidate)
+            self.assertEqual(nonce, candidate.to_bytes(5, "big"))
+            self.assertEqual(candidate_words(candidate), (candidate >> 8, (candidate & 0xFF) << 24))
+            payload = job.materialize_payload(candidate)
+            obj = job.materialize_object(candidate)
+            self.assertEqual(payload[job.nonce_payload_offset : job.nonce_payload_offset + 5], nonce)
+            self.assertEqual(obj[job.nonce_object_offset : job.nonce_object_offset + 5], nonce)
+            words = block_words(job.materialize_final_block(candidate))
+            self.assertEqual(words[12], candidate >> 8)
+            self.assertEqual(words[13] & 0xFF00_0000, (candidate & 0xFF) << 24)
+            self.assertEqual(job.digest_from_prestate(candidate), hashlib.sha1(obj).digest())
+
+        self.assertFalse(nonce_is_log_safe(b"\x01\x02\0\x03\x04"))
+        self.assertTrue(nonce_is_log_safe(b"\x01\x02\x03\x04\xff"))
+
+    def test_target_match_uses_full_materialized_object(self) -> None:
+        job = build_raw_tail_job(b"tree x\n\nmessage\n", TargetPrefix(1, 0))
+        for candidate in range(100):
+            digest = hashlib.sha1(job.materialize_object(candidate)).digest()
+            self.assertEqual(job.matches_target(candidate), digest[0] < 0x80)
+
+    def test_candidate_verifier_checks_policy_hash_and_target(self) -> None:
+        source = b"tree x\n\nmessage\n"
+        planning_job = build_raw_tail_job(source, TargetPrefix(1, 0))
+        candidate = 0x0102_0304_05
+        digest = planning_job.digest(candidate)
+        target = TargetPrefix(160, int.from_bytes(digest, "big"))
+        exact_job = build_raw_tail_job(source, target)
+        self.assertEqual(exact_job.verify_candidate(candidate), digest)
+
+        wrong_job = build_raw_tail_job(source, TargetPrefix(160, int.from_bytes(digest, "big") ^ 1))
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            wrong_job.verify_candidate(candidate)
+        with self.assertRaisesRegex(ValueError, "contains NUL"):
+            exact_job.verify_candidate(0)
+
+    def test_generated_artifacts_are_self_describing(self) -> None:
+        job = build_raw_tail_job(b"tree x\n\nmessage", TargetPrefix.from_hex("abcdef", 21))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            write_job(job, output)
+            manifest = json.loads((output / "job.json").read_text(encoding="utf-8"))
+            self.assertEqual((output / "payload-template.bin").read_bytes(), job.payload_template)
+            self.assertEqual((output / "object-template.bin").read_bytes(), job.object_template)
+            self.assertEqual((output / "final-block-template.bin").read_bytes(), job.final_block_template)
+            self.assertEqual(manifest["schema"], "git-sha1-raw-tail-job-v1")
+            self.assertEqual(manifest["nonce"]["mapping"], "candidate.to_bytes(5, 'big')")
+            self.assertEqual(manifest["target"]["bits"], 21)
+            self.assertEqual(manifest["template_object_sha1"], hashlib.sha1(job.object_template).hexdigest())
+            header = (output / "job_constants.cuh").read_text(encoding="utf-8")
+            self.assertEqual(header, render_cuda_header(job))
+            self.assertIn("JOB_HIN", header)
+            self.assertIn("JOB_BASE16", header)
+            self.assertIn("W12 = candidate >> 8", header)
+
+    def test_newline_mutation_is_explicit(self) -> None:
+        with_newline = build_raw_tail_job(b"message\n", TargetPrefix(1, 0))
+        without_newline = build_raw_tail_job(b"message", TargetPrefix(1, 0))
+        self.assertFalse(with_newline.source_newline_appended)
+        self.assertTrue(without_newline.source_newline_appended)
+        self.assertEqual(without_newline.payload_template[:8], b"message\n")
+
+
+if __name__ == "__main__":
+    unittest.main()
