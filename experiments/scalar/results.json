@@ -1,0 +1,108 @@
+{
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 4060",
+    "compute_capability": "8.9",
+    "cuda": "13.3.1",
+    "nvcc_flags": "-O3 -std=c++17 -arch=sm_89 -lineinfo -Xptxas=-v"
+  },
+  "protocol": {
+    "candidate_count": 536870912,
+    "warmup_launches": 5,
+    "timed_launches_per_sample": 1,
+    "samples": 9,
+    "statistic": "median CUDA event time",
+    "correctness": "four full 160-bit GPU digests matched generated hashlib references before timing"
+  },
+  "supplied_baseline_ghs": 10.9,
+  "variants": [
+    {
+      "variant": "affine-rotating-ilp1-b128",
+      "grid": 192,
+      "median_ghs": 7.651829,
+      "min_ghs": 7.651382,
+      "max_ghs": 7.653169,
+      "registers": 39,
+      "local_bytes": 0,
+      "spill_load_bytes": 0,
+      "spill_store_bytes": 0,
+      "sass_instructions": 574,
+      "sass_shf": 108,
+      "sass_lop3": 222
+    },
+    {
+      "variant": "rolling-struct-ilp1-b128",
+      "grid": 288,
+      "median_ghs": 9.271721,
+      "min_ghs": 9.227823,
+      "max_ghs": 9.272540,
+      "registers": 32,
+      "local_bytes": 0
+    },
+    {
+      "variant": "rolling-rotating-ilp1-b128",
+      "grid": 288,
+      "median_ghs": 9.237741,
+      "min_ghs": 9.234325,
+      "max_ghs": 9.273525,
+      "registers": 32,
+      "local_bytes": 0
+    },
+    {
+      "variant": "rolling-rotating-ilp2-b256",
+      "grid": 288,
+      "median_ghs": 9.419645,
+      "min_ghs": 9.417614,
+      "max_ghs": 9.420829,
+      "registers": 40,
+      "local_bytes": 0,
+      "spill_load_bytes": 0,
+      "spill_store_bytes": 0,
+      "sass_instructions": 1076,
+      "sass_shf": 251,
+      "sass_lop3": 362
+    },
+    {
+      "variant": "rolling32-rotating-ilp1-b512",
+      "grid": 48,
+      "median_ghs": 9.561890,
+      "min_ghs": 9.558229,
+      "max_ghs": 9.567998,
+      "registers": 47,
+      "local_bytes": 0
+    },
+    {
+      "variant": "rolling32-rotating-ilp2-b384",
+      "grid": 192,
+      "median_ghs": 9.643320,
+      "min_ghs": 9.641369,
+      "max_ghs": 9.656107,
+      "registers": 52,
+      "local_bytes": 0,
+      "spill_load_bytes": 0,
+      "spill_store_bytes": 0,
+      "sass_instructions": 1050,
+      "sass_shf": 245,
+      "sass_lop3": 340
+    },
+    {
+      "variant": "rolling32-rotating-ilp4-b512",
+      "grid": 48,
+      "median_ghs": 9.646158,
+      "min_ghs": 9.644561,
+      "max_ghs": 9.646513,
+      "registers": 59,
+      "local_bytes": 0,
+      "spill_load_bytes": 0,
+      "spill_store_bytes": 0,
+      "sass_instructions": 2077,
+      "sass_shf": 491,
+      "sass_lop3": 678
+    }
+  ],
+  "best": {
+    "variant": "rolling32-rotating-ilp4-b512",
+    "median_ghs": 9.646158,
+    "fraction_of_supplied_baseline": 0.884969,
+    "supplied_baseline_speedup": 1.129984
+  }
+}
