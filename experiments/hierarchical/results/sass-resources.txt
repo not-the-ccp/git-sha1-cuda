@@ -1,0 +1,18 @@
+CUDA 13.3.1, nvcc -O3 -std=c++17 -arch=sm_89
+cuobjdump --dump-resource-usage / --dump-sass
+
+Production G4/V4 kernels (dynamic shared memory is supplied at launch):
+
+kernel          registers  stack  local  static SASS  WARPSYNC  LDS  STS  LDG  IADD3
+baseline               64      0      0         2088         1  203   63   32    489
+hierarchical5          66      0      0         2104         1  203   63   32    489
+flat5                  64      0      0         2096         1  203   63   32    489
+epoch24                64      0      0         2088         1  203   63   32    487
+
+The static WARPSYNC count does not express dynamic frequency. hierarchical5
+places its schedule-build and WARPSYNC instructions in the runtime 256-middle
+loop; the other three kernels execute their setup once per group.
+
+Production V8 kernels use 96 registers and no stack/local memory. At B128 the
+G4/V4 hierarchy's 66 registers permit 7 blocks/SM, versus 8 blocks/SM for the
+64-register baseline, flat, and epoch kernels.

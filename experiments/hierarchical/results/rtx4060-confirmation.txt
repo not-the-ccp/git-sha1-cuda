@@ -1,0 +1,17 @@
+GPU digest correctness PASS (all 5 words, all four kernels)
+GPU: NVIDIA GeForce RTX 4060 cc=8.9 SMs=24; samples=7; reference candidates=536870912
+raw4+1-g4-v4-B96         10.8049 GH/s  median=  49.688 ms B= 96 regs= 64 local=0 smem=6144 blocks/SM=10
+raw4+1-g4-v4-B128        10.6684 GH/s  median=  50.323 ms B=128 regs= 64 local=0 smem=8192 blocks/SM=8
+raw4+1-g4-v8-B96         10.8778 GH/s  median=  49.355 ms B= 96 regs= 96 local=0 smem=6144 blocks/SM=6
+raw4+1-g8-v4-B128        10.6625 GH/s  median=  50.351 ms B=128 regs= 64 local=0 smem=4096 blocks/SM=8
+hier3+1+1-g4-v4-B96       9.4930 GH/s  median=  56.554 ms B= 96 regs= 66 local=0 smem=6144 blocks/SM=9
+hier3+1+1-g4-v4-B128     10.2723 GH/s  median=  52.264 ms B=128 regs= 66 local=0 smem=8192 blocks/SM=7
+hier3+1+1-g4-v8-B96       9.6057 GH/s  median=  55.891 ms B= 96 regs= 96 local=0 smem=6144 blocks/SM=6
+hier3+1+1-g8-v4-B128     10.3739 GH/s  median=  51.752 ms B=128 regs= 66 local=0 smem=4096 blocks/SM=7
+flat3+1+1-g4-v4-B128     10.6103 GH/s  median=  50.599 ms B=128 regs= 64 local=0 smem=8192 blocks/SM=8
+flat3+1+1-g4-v8-B96      10.9190 GH/s  median=  49.168 ms B= 96 regs= 96 local=0 smem=6144 blocks/SM=6
+flat3+1+1-g8-v4-B128     10.6185 GH/s  median=  50.560 ms B=128 regs= 64 local=0 smem=4096 blocks/SM=8
+epochW13-g4-v4-B96       10.3178 GH/s  median=   1.626 ms B= 96 regs= 64 local=0 smem=6144 blocks/SM=10
+epochW13-g4-v4-B128      10.5165 GH/s  median=   1.595 ms B=128 regs= 64 local=0 smem=8192 blocks/SM=8
+epochW13-g4-v8-B96       10.7243 GH/s  median=   1.564 ms B= 96 regs= 96 local=0 smem=6144 blocks/SM=6
+epochW13-g8-v4-B128      10.6286 GH/s  median=   1.578 ms B=128 regs= 64 local=0 smem=4096 blocks/SM=8
