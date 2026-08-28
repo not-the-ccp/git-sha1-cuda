@@ -182,5 +182,4 @@ python3 -m unittest -v
 
 ## License
 
-Licensed under the [Mozilla Public License 2.0](LICENSE). The MPL applies at
-file level; independent application files retain their own licensing terms.
+[Mozilla Public License 2.0](LICENSE)
