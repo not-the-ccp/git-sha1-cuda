@@ -1,0 +1,10 @@
+[package]
+name = "git-sha1-cuda"
+version = "0.1.0"
+edition = "2021"
+links = "git_sha1_cuda"
+description = "Safe, dependency-free Rust bindings for the git_sha1_cuda CUDA backend"
+publish = false
+
+[lib]
+path = "src/lib.rs"

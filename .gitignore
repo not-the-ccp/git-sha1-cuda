@@ -3,9 +3,9 @@ __pycache__/
 
 # Generated CUDA jobs, executables, disassembly, and benchmark captures.
 build/
+target/
 *.cubin
 *.fatbin
 *.ptx
 *.sass
 *.o
-

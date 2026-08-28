@@ -24,6 +24,7 @@ from tools.git_sha1_job import (
     sha1_compress_working,
     sha1_digest_independent,
     sha1_pad,
+    sha1_working_after_rounds,
     working_state_matches_prefix,
     write_job,
 )
@@ -63,6 +64,17 @@ class IndependentSha1Tests(unittest.TestCase):
                 padded = sha1_pad(message)
                 self.assertEqual(len(padded) % 64, 0)
                 self.assertEqual(int.from_bytes(padded[-8:], "big"), size * 8)
+
+    def test_partial_round_state_reaches_full_compression(self) -> None:
+        rng = random.Random(0x12_80_5A1)
+        for _ in range(40):
+            state = tuple(rng.getrandbits(32) for _ in range(5))
+            block = rng.randbytes(64)
+            self.assertEqual(sha1_working_after_rounds(state, block, 0), state)
+            self.assertEqual(
+                sha1_working_after_rounds(state, block, 80),
+                sha1_compress_working(state, block),
+            )
 
 
 class TargetPrefixTests(unittest.TestCase):
@@ -179,6 +191,7 @@ class RawTailJobTests(unittest.TestCase):
             header = (output / "job_constants.cuh").read_text(encoding="utf-8")
             self.assertEqual(header, render_cuda_header(job))
             self.assertIn("JOB_HIN", header)
+            self.assertIn("JOB_PRE12", header)
             self.assertIn("JOB_BASE16", header)
             self.assertIn("W12 = candidate >> 8", header)
 
