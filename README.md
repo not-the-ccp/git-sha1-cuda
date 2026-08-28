@@ -1,27 +1,61 @@
 # git-sha1-cuda
 
-This repository provides an embeddable CUDA backend for Git commit SHA-1
-prefix searches. It is a library, not a replacement CLI: an existing Git
-vanity tool can prepare the commit object, pass the final-block job to this
-backend, checkpoint bounded searches, and materialize the returned nonce.
+`git-sha1-cuda` is a CUDA implementation of SHA-1 prefix search for Git commit
+objects. It evaluates a 40-bit candidate space through a C ABI and a safe Rust
+wrapper, with bounded launches for progress reporting and checkpointing.
 
-The optimized path places one raw five-byte candidate at byte offsets 48..52
+The production kernel supports:
+
+- SHA-1 target prefixes from 1 to 160 bits;
+- reusable CUDA contexts and runtime job changes;
+- exact five-word digest capture for candidate verification;
+- shared and static native libraries;
+- deterministic Git job generation with an independent CPU SHA-1 oracle.
+
+## Candidate layout
+
+Each candidate is a five-byte big-endian value at byte offsets 48 through 52
 of the final padded SHA-1 block:
 
 ```text
 candidate 0xAABBCCDDEE -> bytes AA BB CC DD EE
-W12 = 0xAABBCCDD
-W13 high byte = 0xEE
+
+final block W12        = 0xAABBCCDD
+final block W13[31:24] = 0xEE
 ```
 
-Only the final compression block varies. The production kernel shares the
-W12-dependent schedule between pairs of lanes and evaluates all 256 possible
-W13 bytes with a 32 KiB delta table. It supports target prefixes from 1 to 160
-bits and rejects candidates containing NUL before publishing a winner.
+All earlier Git object blocks are fixed and compressed once on the CPU. The
+resulting SHA-1 state becomes the GPU job's `prestate`. The final block stores
+zeroes in W12 and the high byte of W13 until a candidate is materialized.
+
+The kernel computes each W12-dependent message schedule once per lane pair.
+The pair evaluates all 256 W13 bytes using direct rotations and a 32 KiB table
+for multi-term schedule deltas. Candidate bytes containing NUL are hashed but
+excluded from winner publication.
+
+## Performance
+
+Measurements on an NVIDIA GeForce RTX 4060 with CUDA 13.3:
+
+| Target width | Throughput |
+|---|---:|
+| 1–32 bits | 10.95 GH/s |
+| 33–160 bits | 10.79 GH/s |
+
+The production kernel uses 96 registers, 33,280 bytes of dynamic shared
+memory, and no local memory or register spills. The benchmark uses
+billion-candidate launches after warm-up.
+
+Reproducible benchmark generators, resource reports, correctness captures,
+and SASS summaries are available in [`experiments/shared`](experiments/shared).
 
 ## Build
 
-CUDA 12+ and CMake 3.24+ are sufficient:
+Requirements:
+
+- CUDA Toolkit 12 or newer;
+- CMake 3.24 or newer;
+- a C++17 compiler supported by the installed CUDA Toolkit.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -29,95 +63,124 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-This produces `build/libgit_sha1_cuda.so` and, by default,
-`build/libgit_sha1_cuda_static.a`. Set `CMAKE_CUDA_ARCHITECTURES` explicitly
-when cross-compiling; otherwise CMake targets the local GPU.
+The build produces:
 
-The ABI is declared in [`include/git_sha1_cuda.h`](include/git_sha1_cuda.h).
-The central calls are:
+```text
+build/libgit_sha1_cuda.so
+build/libgit_sha1_cuda_static.a
+```
 
-- `gsv_job_init`: validate the final-block layout and derive masks/prestate;
-- `gsv_context_create`: allocate the per-device table and scratch buffers;
-- `gsv_search`: search `outer_count * 256` candidates from `outer_base << 8`;
-- `gsv_digest`: compute all five digest words for one candidate;
-- `gsv_context_set_job`: reuse allocations when the CLI changes its target.
+CMake targets the local GPU architecture by default. Cross-builds can set it
+explicitly, for example:
 
-`gsv_search` is deliberately bounded. For example, an outer count of `2^22`
-is 1,073,741,824 hashes and takes about 0.10 seconds on the tested RTX 4060.
-This makes cancellation, progress reporting, and durable checkpoints simple.
-The returned winner is valid but is not guaranteed to be the numerically
-smallest matching candidate in the range.
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=89
+```
+
+## C API
+
+The public ABI is declared in
+[`include/git_sha1_cuda.h`](include/git_sha1_cuda.h).
+
+| Function | Purpose |
+|---|---|
+| `gsv_job_init` | Validate a final-block job and derive masks and round-12 state |
+| `gsv_context_create` | Allocate device tables, events, and result buffers |
+| `gsv_context_set_job` | Reuse a context with another job |
+| `gsv_search` | Search `outer_count * 256` candidates from `outer_base << 8` |
+| `gsv_digest` | Compute the complete SHA-1 digest for one candidate |
+| `gsv_context_destroy` | Release context resources |
+
+`gsv_search` reports the number of evaluated candidates, CUDA event time, and
+throughput. Winner selection uses a device atomic and may return any matching
+candidate in the requested batch.
+
+An outer count of `2^22` evaluates 1,073,741,824 candidates in about 0.10
+seconds on the measured RTX 4060. Applications can choose batch sizes around
+their desired cancellation and checkpoint latency.
 
 ## Rust
 
-[`rust/git-sha1-cuda`](rust/git-sha1-cuda) is a dependency-free safe wrapper.
-An existing Cargo project can use it directly:
+The crate under [`rust/git-sha1-cuda`](rust/git-sha1-cuda) provides
+dependency-free safe bindings.
 
 ```toml
 [dependencies]
-git-sha1-cuda = { path = "/home/r34/sha1/rust/git-sha1-cuda" }
+git-sha1-cuda = { path = "../git-sha1-cuda/rust/git-sha1-cuda" }
 ```
 
-Build the CUDA library first. If it is not in `/home/r34/sha1/build`, set
-`GSV_LIB_DIR` while building the Rust application and ensure the dynamic
-loader can find the same directory at runtime.
+The build script searches for the native library in the repository's `build`
+directory. `GSV_LIB_DIR` selects a different directory. The platform's dynamic
+loader must also be able to locate `libgit_sha1_cuda.so` at runtime.
 
 ```rust,no_run
 use git_sha1_cuda::{Context, Job};
 
-# fn run(prestate: [u32; 5], final_block_words: [u32; 16], target: [u32; 5])
-#     -> Result<(), Box<dyn std::error::Error>> {
-let job = Job::new(&prestate, &final_block_words, 40, &target)?;
-let mut gpu = Context::new(0, &job)?;
+# fn search(
+#     prestate: [u32; 5],
+#     final_block_words: [u32; 16],
+#     target_words: [u32; 5],
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let job = Job::new(&prestate, &final_block_words, 40, &target_words)?;
+let mut context = Context::new(0, &job)?;
 
-let batch = gpu.search(0, 1 << 22)?;
-if let Some(candidate) = batch.candidate {
-    let digest = gpu.digest(candidate)?;
-    println!("candidate={candidate:010x} digest={digest:08x?}");
+for outer_base in (0..1_u64 << 32).step_by(1 << 22) {
+    let result = context.search(outer_base, 1 << 22)?;
+    if let Some(candidate) = result.candidate {
+        let digest = context.digest(candidate)?;
+        println!("candidate={candidate:010x} digest={digest:08x?}");
+        break;
+    }
 }
 # Ok(())
 # }
 ```
 
-The `prestate` is the SHA-1 state after every fixed block before the final
-block. `final_block_words` uses SHA-1's big-endian word order and must have W12
-and W13's high byte cleared. `target` contains the requested digest bits
-left-aligned across five words.
+## Git job generation
 
-## Preparing Git jobs
-
-[`tools/git_sha1_job.py`](tools/git_sha1_job.py) is the reference job builder
-and independent CPU oracle. Given a raw commit payload, it aligns the nonce,
-writes binary templates plus a JSON manifest, and verifies Git serialization:
+[`tools/git_sha1_job.py`](tools/git_sha1_job.py) builds the aligned commit job
+and verifies Git object serialization independently of the CUDA code.
 
 ```bash
 python3 tools/git_sha1_job.py commit-payload.bin \
-  --target 0123456789 --output job
+  --target 0123456789 \
+  --output job
 ```
 
-The existing CLI can implement the same small preparation step directly, or
-read `prestate`, `base_words`, and aligned target words from `job/job.json`.
-After a winner, replace the five placeholder bytes with
-`candidate.to_be_bytes()[3..]`, hash the full serialized Git object once on
-the CPU, then write it through the CLI's normal Git workflow.
+The output directory contains:
 
-GPG-signed commits are intentionally deferred: a signature makes the long
-armored suffix candidate-dependent and does not fit this one-variable-block
-kernel.
+| File | Contents |
+|---|---|
+| `job.json` | Layout, target, prestate, masks, and candidate offsets |
+| `payload-template.bin` | Commit payload with the five-byte placeholder |
+| `object-template.bin` | Serialized Git object template |
+| `final-block-template.bin` | Padded final SHA-1 block |
+| `job_constants.cuh` | Generated CUDA constants for experiments |
 
-## Measured performance
+After a successful search, the five-byte big-endian candidate replaces the
+placeholder. The CPU oracle hashes the complete serialized object and checks
+the requested prefix before the object is stored.
 
-On an RTX 4060 with CUDA 13.3, the reusable runtime-job ABI sustains about
-**10.95 GH/s** for targets up to 32 bits and **10.79 GH/s** for longer targets
-on billion-candidate launches. The hot kernel uses 96 registers with zero
-local memory and zero spills. This is within roughly 2% of the
-compile-specialized research kernel.
+## Correctness
 
-The experiments and reproducible benchmark evidence are under
-[`experiments/shared`](experiments/shared).
+The test suite covers:
+
+- Git object framing against `git hash-object`;
+- independent SHA-1 compression across padding boundaries;
+- exact GPU/CPU digest agreement;
+- target masks and gates from 1 through 160 bits;
+- candidate byte order and W12/W13 mapping;
+- C ABI search and digest capture on a CUDA device.
+
+Run the host tests directly with:
+
+```bash
+python3 -m unittest -v
+```
 
 ## License
 
-This project is licensed under the [Mozilla Public License 2.0](LICENSE).
-Changes to covered library files remain open, while applications may link the
-library without adopting the MPL for their own independent source files.
+Licensed under the [Mozilla Public License 2.0](LICENSE). The MPL applies at
+file level; independent application files retain their own licensing terms.
