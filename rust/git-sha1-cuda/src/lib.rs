@@ -2,10 +2,23 @@
 
 use std::{error::Error, ffi::CStr, fmt, os::raw::c_char, ptr};
 
+mod git;
+mod sha1;
+
+pub use git::{Carrier, GitJob, PreparationError, TargetPrefix};
+
 const OK: i32 = 0;
 const FOUND: i32 = 1;
 const NOT_FOUND: i32 = 2;
 pub const NO_WINNER: u64 = u64::MAX;
+
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoncePolicy {
+    NoNul = 0,
+    HeaderSafe = 1,
+    PrintableAscii = 2,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -52,6 +65,13 @@ unsafe extern "C" {
     fn gsv_context_create(device: i32, job: *const RawJob, out: *mut *mut RawContext) -> i32;
     fn gsv_context_destroy(context: *mut RawContext);
     fn gsv_context_set_job(context: *mut RawContext, job: *const RawJob) -> i32;
+    fn gsv_context_set_header_job(
+        context: *mut RawContext,
+        job: *const RawJob,
+        suffix_words: *const u32,
+        suffix_block_count: u32,
+    ) -> i32;
+    fn gsv_context_set_nonce_policy(context: *mut RawContext, policy: i32) -> i32;
     fn gsv_search(
         context: *mut RawContext,
         outer_base: u64,
@@ -177,6 +197,39 @@ impl Context {
 
     pub fn set_job(&mut self, job: &Job) -> Result<(), CudaError> {
         let status = unsafe { gsv_context_set_job(self.raw, &job.0) };
+        if status == OK {
+            Ok(())
+        } else {
+            Err(error(status, self.raw))
+        }
+    }
+
+    pub fn set_header_job(
+        &mut self,
+        job: &Job,
+        suffix_blocks: &[[u32; 16]],
+    ) -> Result<(), CudaError> {
+        let suffix_block_count = u32::try_from(suffix_blocks.len()).map_err(|_| CudaError {
+            status: -1,
+            message: "suffix block count exceeds the C ABI limit".to_owned(),
+        })?;
+        let suffix_words = if suffix_blocks.is_empty() {
+            ptr::null()
+        } else {
+            suffix_blocks.as_ptr().cast::<u32>()
+        };
+        let status = unsafe {
+            gsv_context_set_header_job(self.raw, &job.0, suffix_words, suffix_block_count)
+        };
+        if status == OK {
+            Ok(())
+        } else {
+            Err(error(status, self.raw))
+        }
+    }
+
+    pub fn set_nonce_policy(&mut self, policy: NoncePolicy) -> Result<(), CudaError> {
+        let status = unsafe { gsv_context_set_nonce_policy(self.raw, policy as i32) };
         if status == OK {
             Ok(())
         } else {

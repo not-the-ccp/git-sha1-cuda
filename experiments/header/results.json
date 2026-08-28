@@ -1,0 +1,18 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "architecture": "sm_89",
+  "cuda": "13.3.1",
+  "candidates_per_launch": 1073741824,
+  "message_trailer_ghs": 10.95,
+  "custom_header": [
+    {"suffix_blocks": 0, "sha1_blocks_per_candidate": 1, "ghs": 10.69},
+    {"suffix_blocks": 1, "sha1_blocks_per_candidate": 2, "ghs": 5.42},
+    {"suffix_blocks": 2, "sha1_blocks_per_candidate": 3, "ghs": 3.60},
+    {"suffix_blocks": 4, "sha1_blocks_per_candidate": 5, "ghs": 2.14},
+    {"suffix_blocks": 8, "sha1_blocks_per_candidate": 9, "ghs": 1.18}
+  ],
+  "header_kernel_registers": 87,
+  "dynamic_shared_bytes": 33280,
+  "local_bytes": 0,
+  "stack_bytes": 0
+}

@@ -1,21 +1,23 @@
 # git-sha1-cuda
 
 `git-sha1-cuda` is a CUDA implementation of SHA-1 prefix search for Git commit
-objects. It evaluates a 40-bit candidate space through a C ABI and a safe Rust
-wrapper, with bounded launches for progress reporting and checkpointing.
+objects. It prepares complete commit objects in Rust or Python and evaluates a
+40-bit candidate space through a C ABI, with bounded launches for progress
+reporting and checkpointing.
 
 The production kernel supports:
 
 - SHA-1 target prefixes from 1 to 160 bits;
 - reusable CUDA contexts and runtime job changes;
 - exact five-word digest capture for candidate verification;
+- message-trailer and custom-header nonce carriers;
 - shared and static native libraries;
 - deterministic Git job generation with an independent CPU SHA-1 oracle.
 
-## Candidate layout
+## Search layouts
 
 Each candidate is a five-byte big-endian value at byte offsets 48 through 52
-of the final padded SHA-1 block:
+of a mutable SHA-1 block:
 
 ```text
 candidate 0xAABBCCDDEE -> bytes AA BB CC DD EE
@@ -25,13 +27,37 @@ final block W13[31:24] = 0xEE
 ```
 
 All earlier Git object blocks are fixed and compressed once on the CPU. The
-resulting SHA-1 state becomes the GPU job's `prestate`. The final block stores
+resulting SHA-1 state becomes the GPU job's `prestate`. The mutable block stores
 zeroes in W12 and the high byte of W13 until a candidate is materialized.
 
 The kernel computes each W12-dependent message schedule once per lane pair.
 The pair evaluates all 256 W13 bytes using direct rotations and a 32 KiB table
-for multi-term schedule deltas. Candidate bytes containing NUL are hashed but
-excluded from winner publication.
+for multi-term schedule deltas.
+
+Two carriers use this layout:
+
+| Carrier | Commit location | Ordinary Git/GitHub message view | SHA-1 work per candidate | RTX 4060 |
+|---|---|---|---:|---:|
+| Message trailer | Appended to the message | Visible in the full message | 1 block | 10.90 GH/s |
+| Custom header | Immediately before the header/message separator | Hidden from subject and body views | 2 blocks for a typical short message | 5.4 GH/s |
+
+The custom header remains visible in the raw commit object through commands
+such as `git cat-file commit`. Git preserves it as an ordinary unknown header,
+and `git fsck --strict` accepts the resulting object. Header candidates exclude
+NUL and LF bytes; trailer candidates exclude NUL bytes.
+
+Winner publication has three selectable byte policies:
+
+| Policy | Allowed candidate bytes | Eligible 5-byte candidates |
+|---|---|---:|
+| `NoNul` | Every byte except NUL | 98.06% |
+| `HeaderSafe` | Every byte except NUL and LF | 96.15% |
+| `PrintableAscii` | ASCII `0x20` through `0x7e` | 0.704% |
+
+The policy changes which matching candidates are returned and does not change
+raw kernel throughput. Printable ASCII is useful when raw-object readability
+matters; an eight-digit target averages 56 seconds with the trailer layout or
+1 minute 53 seconds with a one-suffix-block header.
 
 ## Performance
 
@@ -42,12 +68,48 @@ Measurements on an NVIDIA GeForce RTX 4060 with CUDA 13.3:
 | 1–32 bits | 10.95 GH/s |
 | 33–160 bits | 10.79 GH/s |
 
-The production kernel uses 96 registers, 33,280 bytes of dynamic shared
+The final-block kernel uses 96 registers, 33,280 bytes of dynamic shared
 memory, and no local memory or register spills. The benchmark uses
-billion-candidate launches after warm-up.
+billion-candidate launches after warm-up. Fixed suffix blocks add one SHA-1
+compression per block:
+
+| Fixed suffix blocks | Throughput |
+|---:|---:|
+| 0 | 10.7 GH/s |
+| 1 | 5.4 GH/s |
+| 2 | 3.6 GH/s |
+| 4 | 2.14 GH/s |
+| 8 | 1.18 GH/s |
+
+### Expected search time
+
+The following averages use 10.95 GH/s for the message trailer and 5.4 GH/s
+for a custom header with one suffix block. They include each carrier's rejected
+candidate bytes.
+
+| Leading hex digits | Candidate bits | Message trailer | Custom header |
+|---:|---:|---:|---:|
+| 7 | 28 | 25 ms | 52 ms |
+| 8 | 32 | 0.40 s | 0.83 s |
+| 9 | 36 | 6.4 s | 13.2 s |
+| 10 | 40 | 1 min 42 s | 3 min 32 s |
+| 11 | 44 | 27 min 18 s | 56 min 28 s |
+| 12 | 48 | 7 h 17 min | 15 h 03 min |
+
+A single job contains 40 candidate bits. Searches wider than ten hexadecimal
+digits require fresh templates carrying additional fixed epoch bits. The table
+assumes epochs continue until a match is found. Search time follows a geometric
+distribution: 50% of searches finish within 0.693 times the average and 95%
+within 3.00 times the average.
+
+`GitJob::header_epoch` encodes a fixed epoch before the candidate while keeping
+the custom-header layout aligned. Applications can reuse a CUDA context across
+epochs with `GitJob::configure_context_with_policy`.
 
 Reproducible benchmark generators, resource reports, correctness captures,
 and SASS summaries are available in [`experiments/shared`](experiments/shared).
+Custom-header measurements and reproduction commands are in
+[`experiments/header`](experiments/header).
 
 ## Build
 
@@ -86,9 +148,11 @@ The public ABI is declared in
 
 | Function | Purpose |
 |---|---|
-| `gsv_job_init` | Validate a final-block job and derive masks and round-12 state |
+| `gsv_job_init` | Validate a mutable block and derive masks and round-12 state |
 | `gsv_context_create` | Allocate device tables, events, and result buffers |
 | `gsv_context_set_job` | Reuse a context with another job |
+| `gsv_context_set_header_job` | Configure a mutable block followed by fixed suffix blocks |
+| `gsv_context_set_nonce_policy` | Select NUL-free, header-safe, or printable winners |
 | `gsv_search` | Search `outer_count * 256` candidates from `outer_base << 8` |
 | `gsv_digest` | Compute the complete SHA-1 digest for one candidate |
 | `gsv_context_destroy` | Release context resources |
@@ -104,7 +168,7 @@ their desired cancellation and checkpoint latency.
 ## Rust
 
 The crate under [`rust/git-sha1-cuda`](rust/git-sha1-cuda) provides
-dependency-free safe bindings.
+dependency-free preparation, CPU verification, and safe CUDA bindings.
 
 ```toml
 [dependencies]
@@ -116,21 +180,20 @@ directory. `GSV_LIB_DIR` selects a different directory. The platform's dynamic
 loader must also be able to locate `libgit_sha1_cuda.so` at runtime.
 
 ```rust,no_run
-use git_sha1_cuda::{Context, Job};
+use git_sha1_cuda::{GitJob, TargetPrefix};
 
-# fn search(
-#     prestate: [u32; 5],
-#     final_block_words: [u32; 16],
-#     target_words: [u32; 5],
-# ) -> Result<(), Box<dyn std::error::Error>> {
-let job = Job::new(&prestate, &final_block_words, 40, &target_words)?;
-let mut context = Context::new(0, &job)?;
+# fn search(commit_payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+let target = TargetPrefix::from_hex("01234567")?;
+let prepared = GitJob::header(commit_payload, target)?;
+let mut context = prepared.create_context(0)?;
 
 for outer_base in (0..1_u64 << 32).step_by(1 << 22) {
     let result = context.search(outer_base, 1 << 22)?;
     if let Some(candidate) = result.candidate {
-        let digest = context.digest(candidate)?;
-        println!("candidate={candidate:010x} digest={digest:08x?}");
+        let digest = prepared.verify_candidate(candidate)?;
+        let finished_payload = prepared.materialize_payload(candidate)?;
+        println!("candidate={candidate:010x} digest={digest:02x?}");
+        std::fs::write("commit-payload.bin", finished_payload)?;
         break;
     }
 }
@@ -146,6 +209,7 @@ and verifies Git object serialization independently of the CUDA code.
 ```bash
 python3 tools/git_sha1_job.py commit-payload.bin \
   --target 0123456789 \
+  --carrier header \
   --output job
 ```
 
@@ -156,8 +220,8 @@ The output directory contains:
 | `job.json` | Layout, target, prestate, masks, and candidate offsets |
 | `payload-template.bin` | Commit payload with the five-byte placeholder |
 | `object-template.bin` | Serialized Git object template |
-| `final-block-template.bin` | Padded final SHA-1 block |
-| `job_constants.cuh` | Generated CUDA constants for experiments |
+| `mutable-block-template.bin` | Padded block containing the custom-header nonce |
+| `suffix-blocks.bin` | Fixed padded blocks following the mutable block |
 
 After a successful search, the five-byte big-endian candidate replaces the
 placeholder. The CPU oracle hashes the complete serialized object and checks
