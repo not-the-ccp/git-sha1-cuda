@@ -130,6 +130,22 @@ __device__ __forceinline__ bool zero_byte(uint32_t x) {
   return ((x - 0x01010101u) & ~x & 0x80808080u) != 0;
 }
 
+__device__ __forceinline__ bool printable_byte(unsigned byte) {
+  return byte - 0x20u <= 0x7eu - 0x20u;
+}
+
+__device__ __forceinline__ bool nonce_valid(uint32_t outer, unsigned inner,
+                                            uint32_t policy) {
+  if (!inner || zero_byte(outer)) return false;
+  if (policy == GSV_NONCE_HEADER_SAFE)
+    return inner != 0x0au && !zero_byte(outer ^ 0x0a0a0a0au);
+  if (policy == GSV_NONCE_PRINTABLE_ASCII)
+    return printable_byte(inner) && printable_byte(outer >> 24) &&
+           printable_byte((outer >> 16) & 0xffu) && printable_byte((outer >> 8) & 0xffu) &&
+           printable_byte(outer & 0xffu);
+  return true;
+}
+
 template<int MODE> __device__ __forceinline__ bool target_match(uint32_t a80, const S &s) {
   if constexpr (MODE == 0) {
     return uint32_t(a80 - C_JOB.h0_gate_base) < C_JOB.h0_gate_span;
@@ -149,9 +165,42 @@ template<int MODE> __device__ __forceinline__ bool target_match(uint32_t a80, co
   }
 }
 
-template<int MODE, bool DIAG>
+__device__ __forceinline__ bool target_match_digest(const S &h) {
+  const uint32_t words[5] = {h.a, h.b, h.c, h.d, h.e};
+  #pragma unroll
+  for (int i = 0; i < 5; ++i)
+    if ((words[i] & C_JOB.target_masks[i]) != (C_JOB.target_words[i] & C_JOB.target_masks[i]))
+      return false;
+  return true;
+}
+
+__device__ __forceinline__ void compress_suffix(S &h, const uint32_t *schedules,
+                                                uint32_t block_count) {
+  for (uint32_t block = 0; block < block_count; ++block) {
+    const S input = h;
+    S s = h;
+    const uint32_t *w = schedules + size_t(block) * 80;
+    #pragma unroll
+    for (int t = 0; t < 20; ++t) round_ch(s, w[t]);
+    #pragma unroll
+    for (int t = 20; t < 40; ++t) round_pa1(s, w[t]);
+    #pragma unroll
+    for (int t = 40; t < 60; ++t) round_mj(s, w[t]);
+    #pragma unroll
+    for (int t = 60; t < 80; ++t) round_pa3(s, w[t]);
+    h.a = input.a + s.a;
+    h.b = input.b + s.b;
+    h.c = input.c + s.c;
+    h.d = input.d + s.d;
+    h.e = input.e + s.e;
+  }
+}
+
+template<int MODE, bool DIAG, bool HEADER>
 __global__ void search_kernel(uint64_t outer_base, uint64_t outer_count, const uint32_t *table,
-                              uint64_t *winner, unsigned diag_inner, uint32_t *diag) {
+                              const uint32_t *suffix_schedules, uint32_t suffix_blocks,
+                              uint32_t nonce_policy, uint64_t *winner,
+                              unsigned diag_inner, uint32_t *diag) {
   extern __shared__ uint32_t shared[];
   const int lane = threadIdx.x & (G - 1);
   const int groups = blockDim.x / G;
@@ -631,15 +680,22 @@ __global__ void search_kernel(uint64_t outer_base, uint64_t outer_count, const u
       for (int i = 0; i < V; ++i) {
         const uint32_t a80 = final_a(st[i], bw ^ dv.x[i]);
         const unsigned inner = j + unsigned(i);
+        S digest{a80 + C_JOB.prestate[0],
+                 st[i].a + C_JOB.prestate[1],
+                 rol32(st[i].b, 30) + C_JOB.prestate[2],
+                 st[i].c + C_JOB.prestate[3],
+                 st[i].d + C_JOB.prestate[4]};
+        if constexpr (HEADER) compress_suffix(digest, suffix_schedules, suffix_blocks);
         if constexpr (DIAG) {
           if (inner == diag_inner) {
-            diag[0] = a80 + C_JOB.prestate[0];
-            diag[1] = st[i].a + C_JOB.prestate[1];
-            diag[2] = rol32(st[i].b, 30) + C_JOB.prestate[2];
-            diag[3] = st[i].c + C_JOB.prestate[3];
-            diag[4] = st[i].d + C_JOB.prestate[4];
+            diag[0] = digest.a;
+            diag[1] = digest.b;
+            diag[2] = digest.c;
+            diag[3] = digest.d;
+            diag[4] = digest.e;
           }
-        } else if (target_match<MODE>(a80, st[i]) && inner && !zero_byte(outer)) {
+        } else if ((HEADER ? target_match_digest(digest) : target_match<MODE>(a80, st[i])) &&
+                   nonce_valid(outer, inner, nonce_policy)) {
           atomicCAS(reinterpret_cast<unsigned long long *>(winner),
                     static_cast<unsigned long long>(GSV_NO_WINNER),
                     static_cast<unsigned long long>((uint64_t(outer) << 8) | inner));
@@ -653,6 +709,11 @@ struct gsv_context {
   int32_t device = 0;
   gsv_job job{};
   uint32_t *table = nullptr;
+  uint32_t *suffix_schedules = nullptr;
+  size_t suffix_capacity_words = 0;
+  uint32_t suffix_blocks = 0;
+  bool header_mode = false;
+  gsv_nonce_policy nonce_policy = GSV_NONCE_NO_NUL;
   uint64_t *winner = nullptr;
   uint32_t *diag = nullptr;
   cudaEvent_t begin = nullptr;
@@ -748,6 +809,7 @@ static void cleanup_context(gsv_context *ctx) {
   if (ctx->begin) cudaEventDestroy(ctx->begin);
   if (ctx->diag) cudaFree(ctx->diag);
   if (ctx->winner) cudaFree(ctx->winner);
+  if (ctx->suffix_schedules) cudaFree(ctx->suffix_schedules);
   if (ctx->table) cudaFree(ctx->table);
   delete ctx;
 }
@@ -757,13 +819,16 @@ static gsv_status upload_job(gsv_context *ctx) {
   return e == cudaSuccess ? GSV_OK : cuda_error(ctx, e, "cudaMemcpyToSymbol(job)");
 }
 
-template<int MODE>
+template<int MODE, bool HEADER>
 static cudaError_t launch_search(uint64_t outer_base, uint64_t outer_count,
-                                 const uint32_t *table, uint64_t *winner) {
+                                 const uint32_t *table, const uint32_t *suffix_schedules,
+                                 uint32_t suffix_blocks, gsv_nonce_policy nonce_policy,
+                                 uint64_t *winner) {
   const uint64_t groups = BLOCK / G;
   const uint32_t blocks = uint32_t((outer_count + groups - 1) / groups);
-  search_kernel<MODE, false><<<blocks, BLOCK, DYNAMIC_SMEM>>>(
-      outer_base, outer_count, table, winner, 0, nullptr);
+  search_kernel<MODE, false, HEADER><<<blocks, BLOCK, DYNAMIC_SMEM>>>(
+      outer_base, outer_count, table, suffix_schedules, suffix_blocks, nonce_policy,
+      winner, 0, nullptr);
   return cudaGetLastError();
 }
 
@@ -864,6 +929,71 @@ gsv_status gsv_context_set_job(gsv_context *ctx, const gsv_job *job) {
   if (valid != GSV_OK) { set_error(ctx, "invalid job"); return valid; }
   std::lock_guard<std::mutex> lock(g_cuda_mutex);
   ctx->job = *job;
+  ctx->header_mode = false;
+  ctx->suffix_blocks = 0;
+  ctx->nonce_policy = GSV_NONCE_NO_NUL;
+  ctx->error.clear();
+  return GSV_OK;
+}
+
+gsv_status gsv_context_set_header_job(gsv_context *ctx, const gsv_job *job,
+                                      const uint32_t *suffix_words,
+                                      uint32_t suffix_block_count) {
+  if (!ctx) { set_error(nullptr, "context is null"); return GSV_INVALID_ARGUMENT; }
+  gsv_status valid = validate_impl(job, false);
+  if (valid != GSV_OK) { set_error(ctx, "invalid job"); return valid; }
+  if (suffix_block_count && !suffix_words) {
+    set_error(ctx, "suffix_words is null for a non-empty suffix");
+    return GSV_INVALID_ARGUMENT;
+  }
+  if (suffix_block_count > (UINT32_MAX / 80u)) {
+    set_error(ctx, "suffix block count is too large");
+    return GSV_INVALID_ARGUMENT;
+  }
+
+  std::vector<uint32_t> schedules;
+  try {
+    schedules.resize(size_t(suffix_block_count) * 80u);
+    for (uint32_t block = 0; block < suffix_block_count; ++block)
+      expand_schedule(suffix_words + size_t(block) * 16u,
+                      schedules.data() + size_t(block) * 80u);
+  } catch (const std::bad_alloc &) {
+    set_error(ctx, "host suffix-schedule allocation failed");
+    return GSV_INTERNAL_ERROR;
+  }
+
+  std::lock_guard<std::mutex> lock(g_cuda_mutex);
+  cudaError_t e = cudaSetDevice(ctx->device);
+  if (e != cudaSuccess) return cuda_error(ctx, e, "cudaSetDevice");
+  const size_t words = schedules.size();
+  if (words > ctx->suffix_capacity_words) {
+    uint32_t *replacement = nullptr;
+    if ((e = cudaMalloc(&replacement, words * sizeof(uint32_t))) != cudaSuccess)
+      return cuda_error(ctx, e, "allocate suffix schedules");
+    if (ctx->suffix_schedules) cudaFree(ctx->suffix_schedules);
+    ctx->suffix_schedules = replacement;
+    ctx->suffix_capacity_words = words;
+  }
+  if (words && (e = cudaMemcpy(ctx->suffix_schedules, schedules.data(), words * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice)) != cudaSuccess)
+    return cuda_error(ctx, e, "upload suffix schedules");
+  ctx->job = *job;
+  ctx->header_mode = true;
+  ctx->suffix_blocks = suffix_block_count;
+  ctx->nonce_policy = GSV_NONCE_HEADER_SAFE;
+  ctx->error.clear();
+  return GSV_OK;
+}
+
+gsv_status gsv_context_set_nonce_policy(gsv_context *ctx, gsv_nonce_policy policy) {
+  if (!ctx) { set_error(nullptr, "context is null"); return GSV_INVALID_ARGUMENT; }
+  if (policy != GSV_NONCE_NO_NUL && policy != GSV_NONCE_HEADER_SAFE &&
+      policy != GSV_NONCE_PRINTABLE_ASCII) {
+    set_error(ctx, "unknown nonce policy");
+    return GSV_INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> lock(g_cuda_mutex);
+  ctx->nonce_policy = policy;
   ctx->error.clear();
   return GSV_OK;
 }
@@ -887,9 +1017,27 @@ gsv_status gsv_search(gsv_context *ctx, uint64_t outer_base, uint64_t outer_coun
   if ((e = cudaMemcpy(ctx->winner, &none, sizeof(none), cudaMemcpyHostToDevice)) != cudaSuccess)
     return cuda_error(ctx, e, "reset winner");
   if ((e = cudaEventRecord(ctx->begin)) != cudaSuccess) return cuda_error(ctx, e, "record begin event");
-  if (ctx->job.target_bits < 32) e = launch_search<0>(outer_base, outer_count, ctx->table, ctx->winner);
-  else if (ctx->job.target_bits == 32) e = launch_search<1>(outer_base, outer_count, ctx->table, ctx->winner);
-  else e = launch_search<2>(outer_base, outer_count, ctx->table, ctx->winner);
+  if (ctx->header_mode) {
+    if (ctx->job.target_bits < 32)
+      e = launch_search<0, true>(outer_base, outer_count, ctx->table, ctx->suffix_schedules,
+                                 ctx->suffix_blocks, ctx->nonce_policy, ctx->winner);
+    else if (ctx->job.target_bits == 32)
+      e = launch_search<1, true>(outer_base, outer_count, ctx->table, ctx->suffix_schedules,
+                                 ctx->suffix_blocks, ctx->nonce_policy, ctx->winner);
+    else
+      e = launch_search<2, true>(outer_base, outer_count, ctx->table, ctx->suffix_schedules,
+                                 ctx->suffix_blocks, ctx->nonce_policy, ctx->winner);
+  } else {
+    if (ctx->job.target_bits < 32)
+      e = launch_search<0, false>(outer_base, outer_count, ctx->table, nullptr, 0,
+                                  ctx->nonce_policy, ctx->winner);
+    else if (ctx->job.target_bits == 32)
+      e = launch_search<1, false>(outer_base, outer_count, ctx->table, nullptr, 0,
+                                  ctx->nonce_policy, ctx->winner);
+    else
+      e = launch_search<2, false>(outer_base, outer_count, ctx->table, nullptr, 0,
+                                  ctx->nonce_policy, ctx->winner);
+  }
   if (e != cudaSuccess) return cuda_error(ctx, e, "launch search kernel");
   if ((e = cudaEventRecord(ctx->end)) != cudaSuccess || (e = cudaEventSynchronize(ctx->end)) != cudaSuccess)
     return cuda_error(ctx, e, "wait for search kernel");
@@ -913,8 +1061,14 @@ gsv_status gsv_digest(gsv_context *ctx, uint64_t candidate, uint32_t digest[5]) 
   if ((e = cudaSetDevice(ctx->device)) != cudaSuccess) return cuda_error(ctx, e, "cudaSetDevice");
   gsv_status uploaded = upload_job(ctx);
   if (uploaded != GSV_OK) return uploaded;
-  search_kernel<0, true><<<1, BLOCK, DYNAMIC_SMEM>>>(candidate >> 8, 1, ctx->table, nullptr,
-                                                     unsigned(candidate & 0xffu), ctx->diag);
+  if (ctx->header_mode)
+    search_kernel<0, true, true><<<1, BLOCK, DYNAMIC_SMEM>>>(
+        candidate >> 8, 1, ctx->table, ctx->suffix_schedules, ctx->suffix_blocks,
+        ctx->nonce_policy, nullptr, unsigned(candidate & 0xffu), ctx->diag);
+  else
+    search_kernel<0, true, false><<<1, BLOCK, DYNAMIC_SMEM>>>(
+        candidate >> 8, 1, ctx->table, nullptr, 0, ctx->nonce_policy, nullptr,
+        unsigned(candidate & 0xffu), ctx->diag);
   if ((e = cudaGetLastError()) != cudaSuccess || (e = cudaDeviceSynchronize()) != cudaSuccess)
     return cuda_error(ctx, e, "digest kernel");
   if ((e = cudaMemcpy(digest, ctx->diag, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost)) != cudaSuccess)

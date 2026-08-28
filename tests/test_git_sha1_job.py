@@ -13,10 +13,12 @@ from tools.git_sha1_job import (
     RAW_NONCE_BLOCK_OFFSET,
     TargetPrefix,
     block_words,
+    build_header_job,
     build_raw_tail_job,
     candidate_nonce,
     candidate_words,
     h0_gate_parameters,
+    nonce_is_header_safe,
     nonce_is_log_safe,
     render_cuda_header,
     serialize_git_commit,
@@ -26,6 +28,7 @@ from tools.git_sha1_job import (
     sha1_pad,
     sha1_working_after_rounds,
     working_state_matches_prefix,
+    write_header_job,
     write_job,
 )
 
@@ -201,6 +204,103 @@ class RawTailJobTests(unittest.TestCase):
         self.assertFalse(with_newline.source_newline_appended)
         self.assertTrue(without_newline.source_newline_appended)
         self.assertEqual(without_newline.payload_template[:8], b"message\n")
+
+
+class HeaderJobTests(unittest.TestCase):
+    def test_layout_and_digest_across_message_lengths(self) -> None:
+        rng = random.Random(0x4845_4144)
+        for size in list(range(0, 180)) + [511, 1024, 4097]:
+            message = rng.randbytes(size)
+            source = b"tree deadbeef\nauthor A <a@localhost> 0 +0000\ncommitter A <a@localhost> 0 +0000\n\n" + message
+            job = build_header_job(source, TargetPrefix.from_hex("12345678"))
+            candidate = 0x6162_6364_65
+            with self.subTest(size=size):
+                self.assertEqual(job.nonce_object_offset % 64, RAW_NONCE_BLOCK_OFFSET)
+                self.assertGreaterEqual(len(job.suffix_blocks), int(bool(message)))
+                self.assertEqual(job.mutable_block_template[48:53], b"\0" * 5)
+                self.assertEqual(job.digest_from_prestate(candidate), job.digest(candidate))
+                payload = job.materialize_payload(candidate)
+                separator = payload.index(b"\n\n")
+                self.assertIn(b"\nx ", payload[:separator])
+                self.assertEqual(payload[separator + 2 :], message)
+
+    def test_header_nonce_policy(self) -> None:
+        self.assertTrue(nonce_is_header_safe(b"abcde"))
+        self.assertFalse(nonce_is_header_safe(b"ab\0de"))
+        self.assertFalse(nonce_is_header_safe(b"ab\nde"))
+
+    def test_git_accepts_header_without_exposing_it_as_message(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "init", "-q", directory], check=True)
+            tree = subprocess.run(
+                ["git", "-C", directory, "mktree"],
+                input=b"",
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout.strip()
+            source = (
+                b"tree "
+                + tree
+                + b"\nauthor Test <test@localhost> 0 +0000"
+                + b"\ncommitter Test <test@localhost> 0 +0000"
+                + b"\n\nvisible subject\n"
+            )
+            job = build_header_job(source, TargetPrefix(1, 0))
+            payload = job.materialize_payload(0x6162_6364_65)
+            oid = subprocess.run(
+                ["git", "-C", directory, "hash-object", "-t", "commit", "-w", "--stdin"],
+                input=payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            ).stdout.strip()
+            stored = subprocess.run(
+                ["git", "-C", directory, "cat-file", "commit", oid],
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout
+            subject = subprocess.run(
+                ["git", "-C", directory, "show", "-s", "--format=%s", oid],
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "-C", directory, "fsck", "--strict", "--no-dangling"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            self.assertEqual(stored, payload)
+            self.assertEqual(subject, b"visible subject")
+            self.assertIn(b"\nx ", stored[: stored.index(b"\n\n")])
+
+    def test_generated_header_artifacts_include_suffix(self) -> None:
+        source = b"tree x\nauthor A <a@localhost> 0 +0000\ncommitter A <a@localhost> 0 +0000\n\nmessage\n"
+        job = build_header_job(source, TargetPrefix.from_hex("abcdef"))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            write_header_job(job, output)
+            manifest = json.loads((output / "job.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["schema"], "git-sha1-header-job-v1")
+            self.assertEqual(
+                (output / "mutable-block-template.bin").read_bytes(),
+                job.mutable_block_template,
+            )
+            self.assertEqual(
+                (output / "suffix-blocks.bin").read_bytes(),
+                b"".join(job.suffix_blocks),
+            )
+
+    def test_fixed_value_prefix_creates_new_search_domain(self) -> None:
+        source = b"tree x\nauthor A <a@localhost> 0 +0000\ncommitter A <a@localhost> 0 +0000\n\nmessage\n"
+        target = TargetPrefix.from_hex("0123456789a")
+        first = build_header_job(source, target, value_prefix=b"0000000000000000 ")
+        second = build_header_job(source, target, value_prefix=b"0000000000000001 ")
+        candidate = 0x6162_6364_65
+        self.assertEqual(first.nonce_object_offset % 64, RAW_NONCE_BLOCK_OFFSET)
+        self.assertEqual(second.nonce_object_offset % 64, RAW_NONCE_BLOCK_OFFSET)
+        self.assertNotEqual(first.object_template, second.object_template)
+        self.assertNotEqual(first.digest(candidate), second.digest(candidate))
 
 
 if __name__ == "__main__":

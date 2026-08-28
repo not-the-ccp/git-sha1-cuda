@@ -32,15 +32,22 @@ typedef enum gsv_status {
   GSV_INTERNAL_ERROR = -4
 } gsv_status;
 
+typedef enum gsv_nonce_policy {
+  GSV_NONCE_NO_NUL = 0,
+  GSV_NONCE_HEADER_SAFE = 1,
+  GSV_NONCE_PRINTABLE_ASCII = 2
+} gsv_nonce_policy;
+
 /*
- * Runtime job for the optimized final-block layout:
+ * Runtime job for the optimized mutable-block layout:
  *
  *   final SHA-1 block byte 48..51 = candidate bits 39..8 (W12)
  *   final SHA-1 block byte 52     = candidate bits 7..0 (W13 high byte)
  *
  * base_words[12] and the high byte of base_words[13] must be zero. The
- * remaining final-block words include the fixed Git bytes and SHA-1 padding.
- * target_words are the requested digest prefix left-aligned in five words.
+ * remaining words include fixed Git bytes. For final-block jobs they also
+ * contain SHA-1 padding. target_words are the requested digest prefix
+ * left-aligned in five words.
  */
 typedef struct gsv_job {
   uint32_t abi_version;
@@ -86,6 +93,22 @@ GSV_API gsv_status gsv_context_create(int32_t device,
 GSV_API void gsv_context_destroy(gsv_context *context);
 GSV_API gsv_status gsv_context_set_job(gsv_context *context,
                                        const gsv_job *job);
+
+/*
+ * Configure a custom-header job. The mutable block uses the same W12/W13
+ * candidate layout as gsv_job. suffix_words contains suffix_block_count
+ * complete, fixed SHA-1 blocks as big-endian words. A zero-block suffix is
+ * valid. The default winner policy rejects candidate bytes containing NUL or
+ * LF and can be changed with gsv_context_set_nonce_policy.
+ */
+GSV_API gsv_status gsv_context_set_header_job(gsv_context *context,
+                                              const gsv_job *job,
+                                              const uint32_t *suffix_words,
+                                              uint32_t suffix_block_count);
+
+/* Select which candidate byte strings may be published as winners. */
+GSV_API gsv_status gsv_context_set_nonce_policy(gsv_context *context,
+                                                gsv_nonce_policy policy);
 
 /*
  * Search outer_count W12 values beginning at outer_base. Each outer value
