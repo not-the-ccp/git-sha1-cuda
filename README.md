@@ -115,3 +115,9 @@ compile-specialized research kernel.
 
 The experiments and reproducible benchmark evidence are under
 [`experiments/shared`](experiments/shared).
+
+## License
+
+This project is licensed under the [Mozilla Public License 2.0](LICENSE).
+Changes to covered library files remain open, while applications may link the
+library without adopting the MPL for their own independent source files.
