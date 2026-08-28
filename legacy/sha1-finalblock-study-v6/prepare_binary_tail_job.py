@@ -43,7 +43,7 @@ def find_layout(payload,label):
     # Keep the high-throughput binary field isolated on its own final line.
     for filler in range(0,256):
       ph=b'\x01'*5
-      suffix=label+b'_'*filler+ph+b'\n'
+      suffix=label+b' '*filler+ph+b'\n'
       p=payload+suffix;obj=git_obj(p); hdr=len(obj)-len(p)
       poff=len(payload)+len(label)+filler; off=hdr+poff
       if off%64==48:
@@ -56,7 +56,7 @@ def arr(name,x): return f'static constexpr uint32_t {name}[{len(x)}]={{'+','.joi
 
 def main():
     ap=argparse.ArgumentParser(description='Prepare exact Git final-block job for raw 4+1-byte CUDA kernel')
-    ap.add_argument('commit_payload');ap.add_argument('-o','--out',required=True);ap.add_argument('--label',default='Vanity-Binary: ')
+    ap.add_argument('commit_payload');ap.add_argument('-o','--out',required=True);ap.add_argument('--label',default='X: ')
     a=ap.parse_args();src=Path(a.commit_payload).read_bytes();label=a.label.encode('ascii')
     payload,obj,poff,noff,filler=find_layout(src,label);padded=pad(obj);blocks=[padded[i:i+64] for i in range(0,len(padded),64)];mb=noff//64
     iv=[0x67452301,0xefcdab89,0x98badcfe,0x10325476,0xc3d2e1f0];h=iv

@@ -81,11 +81,11 @@ def words(block: bytes) -> list[int]:
 def make_job(payload: bytes) -> dict[str, object]:
     if not payload.endswith(b"\n"):
         payload += b"\n"
-    label = b"Vanity-Binary: "
+    label = b"X: "
     selected = None
     for filler in range(256):
         nonce_payload_offset = len(payload) + len(label) + filler
-        candidate_payload = payload + label + b"_" * filler + b"\0" * 5 + b"\n"
+        candidate_payload = payload + label + b" " * filler + b"\0" * 5 + b"\n"
         obj = b"commit " + str(len(candidate_payload)).encode() + b"\0" + candidate_payload
         header_bytes = len(obj) - len(candidate_payload)
         nonce_object_offset = header_bytes + nonce_payload_offset

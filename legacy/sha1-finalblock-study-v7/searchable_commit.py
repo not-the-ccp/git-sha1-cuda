@@ -76,7 +76,7 @@ def candidate_metrics(payload: bytes, nonce_payload_offset: int, nonce_len: int,
     }
 
 
-def append_aligned_tail(payload: bytes, *, label: bytes, nonce_len: int, target_mod: int, filler_byte: bytes = b"_") -> tuple[bytes,int,int]:
+def append_aligned_tail(payload: bytes, *, label: bytes, nonce_len: int, target_mod: int, filler_byte: bytes = b" ") -> tuple[bytes,int,int]:
     if len(filler_byte) != 1:
         raise ValueError("filler byte must be length 1")
     base = payload if payload.endswith(b"\n") else payload + b"\n"
@@ -171,7 +171,7 @@ def plans(payload: bytes, bits: int) -> list[dict]:
         ))
     # Maximum-throughput 4+1 raw field. All 256 values are hashed; winner is
     # accepted only when no byte is NUL. This preserves direct W12 counter math.
-    p,off,fill=append_aligned_tail(payload,label=b"Vanity-Binary: ",nonce_len=5,target_mod=48)
+    p,off,fill=append_aligned_tail(payload,label=b"X: ",nonce_len=5,target_mod=48)
     out.append(make_plan(
         "binary-tail-4+1",p,off,5,256,bits,"binary-message",
         "invalidates-existing-signature" if sig!="none" else "unsigned",
@@ -271,7 +271,7 @@ def main() -> int:
         if name.startswith('printable-tail-'):
             n=int(name.rsplit('-',1)[1]);p,off,_=best_printable_tail(payload,label=b"Vanity: ",nonce_len=n)
         elif name=='binary-tail-4+1':
-            p,off,_=append_aligned_tail(payload,label=b"Vanity-Binary: ",nonce_len=5,target_mod=48)
+            p,off,_=append_aligned_tail(payload,label=b"X: ",nonce_len=5,target_mod=48)
         elif name.startswith('pgp-armor-comment-'):
             n=int(name.rsplit('-',1)[1]);p,off,_=best_pgp_armor_comment(payload,n)
         else: raise AssertionError(name)

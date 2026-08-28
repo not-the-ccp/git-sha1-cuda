@@ -435,8 +435,8 @@ def build_raw_tail_job(
     payload: bytes,
     target: TargetPrefix,
     *,
-    label: bytes = b"Vanity-Binary: ",
-    filler_byte: bytes = b"_",
+    label: bytes = b"X: ",
+    filler_byte: bytes = b" ",
     placeholder: bytes = b"PPPPP",
     max_filler: int = 4096,
 ) -> RawTailJob:
@@ -547,7 +547,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         help="use this many leading bits of --target (default: all supplied nibbles)",
     )
-    parser.add_argument("--label", default="Vanity-Binary: ", help="ASCII trailer label")
+    parser.add_argument("--label", default="X: ", help="ASCII trailer label")
     return parser.parse_args(argv)
 
 
