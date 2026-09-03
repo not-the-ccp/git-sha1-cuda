@@ -142,17 +142,24 @@ Requirements:
 - Git.
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-ctest --test-dir build --output-on-failure
-
-GSV_LIB_DIR="$PWD/build" \
-  cargo build --release --manifest-path rust/git-sha1-cuda/Cargo.toml
+cargo build --release --manifest-path rust/git-sha1-cuda/Cargo.toml
 ```
 
 The CLI binary is written to
-`rust/git-sha1-cuda/target/release/git-sha1-cuda`. The native build produces
-`build/libgit_sha1_cuda.so` and `build/libgit_sha1_cuda_static.a`.
+`rust/git-sha1-cuda/target/release/git-sha1-cuda`. Cargo configures and builds
+the native CUDA library through CMake. Set `CMAKE_CUDA_ARCHITECTURES` when the
+build should target a specific GPU architecture instead of the local GPU.
+
+Build the C library and its tests directly with:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+This produces `build/libgit_sha1_cuda.so` and
+`build/libgit_sha1_cuda_static.a`.
 
 CMake targets the local GPU architecture by default. Set
 `CMAKE_CUDA_ARCHITECTURES` for a distributable or cross-compiled build:
@@ -192,8 +199,8 @@ for candidate_base in (0..1_u64 << 40).step_by(1 << 30) {
 # }
 ```
 
-`GSV_LIB_DIR` selects the directory containing `libgit_sha1_cuda.so` while
-building the crate.
+`GSV_LIB_DIR` selects an existing `libgit_sha1_cuda.so` and skips Cargo's
+native CMake build.
 
 ## C API
 
