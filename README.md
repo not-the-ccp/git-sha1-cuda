@@ -120,13 +120,13 @@ Measurements on a GeForce RTX 4060 with CUDA 13.3:
 |---|---|---|---:|
 | Printable header | Eight characters from ASCII `0x20..0x3f` | Hidden | 5.05 GH/s |
 | Raw header API | Five header-safe bytes | Hidden | 5.4 GH/s |
-| Message trailer | Five NUL-free bytes | Visible | 10.9 GH/s |
+| Message trailer | Five NUL-free bytes | Visible | 10.4 GH/s |
 
 The printable header is the CLI default. It has a complete 40-bit candidate
 space without rejected byte strings and is only about 7% slower than the raw
 header kernel.
 
-| Leading hex digits | Average time | 95% complete by |
+| Leading hex digits | Ideal average | 95% complete by |
 |---:|---:|---:|
 | 6 | 3.3 ms | 10 ms |
 | 7 | 53 ms | 0.16 s |
@@ -136,8 +136,14 @@ header kernel.
 | 11 | 58 min | 2 h 54 min |
 | 12 | 15 h 29 min | 46 h 27 min |
 
-Search time follows a geometric distribution. The median is about 69% of the
-average, so individual runs vary considerably.
+These times divide the expected hash count by steady-state throughput. Search
+time follows a geometric distribution. The median is about 69% of the average,
+so individual runs vary considerably.
+
+The CLI scales batches from `2^20` to `2^30` candidates according to prefix
+length. Five- and six-digit searches take about 15–25 ms on the measured RTX
+4060; at that scale, kernel launch and batch overhead dominate the ideal hash
+time. Larger searches approach the throughput-derived values in the table.
 
 The message trailer is faster because its mutable block is the final SHA-1
 block. A custom header typically evaluates one additional fixed block per

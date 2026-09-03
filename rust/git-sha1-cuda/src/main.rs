@@ -14,9 +14,15 @@ use git_sha1_cuda::{
 
 const RAW_OUTER_BATCH: u64 = 1 << 22;
 const RAW_OUTER_DOMAIN: u64 = 1 << 32;
+const RAW_OUTER_START: u64 = 0x0101_0101;
 const PRINTABLE_BATCH: u64 = 1 << 30;
 const PRINTABLE_DOMAIN: u64 = 1 << 40;
 type IdentParts<'a> = (&'a [u8], &'a [u8]);
+
+fn candidate_batch_size(target_bits: u32) -> u64 {
+    let exponent = target_bits.saturating_sub(2).clamp(20, 30);
+    1_u64 << exponent
+}
 
 struct CommitArgs {
     prefix: String,
@@ -71,10 +77,18 @@ impl PreparedJob {
         Ok(())
     }
 
-    fn batch_size(&self) -> u64 {
+    fn maximum_batch_size(&self) -> u64 {
         match self {
             Self::Printable(_) => PRINTABLE_BATCH,
             Self::Raw(_) => RAW_OUTER_BATCH,
+        }
+    }
+
+    fn batch_size(&self, target_bits: u32) -> u64 {
+        let candidates = candidate_batch_size(target_bits);
+        match self {
+            Self::Printable(_) => candidates,
+            Self::Raw(_) => candidates / 256,
         }
     }
 
@@ -93,8 +107,15 @@ impl PreparedJob {
     ) -> Result<SearchResult, Box<dyn Error>> {
         Ok(match self {
             Self::Printable(_) => context.search_masked_header(base, count)?,
-            Self::Raw(_) => context.search(base, count)?,
+            Self::Raw(_) => context.search(raw_outer_base(base), count)?,
         })
+    }
+
+    fn contiguous_count(&self, base: u64, requested: u64) -> u64 {
+        match self {
+            Self::Printable(_) => requested,
+            Self::Raw(_) => requested.min(RAW_OUTER_DOMAIN - raw_outer_base(base)),
+        }
     }
 
     fn verify_candidate(&self, candidate: u64) -> Result<[u8; 20], Box<dyn Error>> {
@@ -110,6 +131,10 @@ impl PreparedJob {
             Self::Raw(job) => job.materialize_payload(candidate)?,
         })
     }
+}
+
+fn raw_outer_base(logical_base: u64) -> u64 {
+    (logical_base + RAW_OUTER_START) & (RAW_OUTER_DOMAIN - 1)
 }
 
 fn usage() -> &'static str {
@@ -584,7 +609,7 @@ benchmark\n";
     let target = TargetPrefix::from_hex("ffffffffffffffffffffffffffffffffffffffff")?;
     let job = prepare_job(PAYLOAD, target, carrier, 0)?;
     let mut context = job.create_context(device)?;
-    let batch = job.batch_size();
+    let batch = job.maximum_batch_size();
 
     // Warm up CUDA context initialization, code loading, and clock ramp-up.
     let _ = job.search(&mut context, 0, batch)?;
@@ -631,7 +656,7 @@ fn run_benchmark(device: i32) -> Result<(), Box<dyn Error>> {
     println!("\nThroughput");
     println!("  printable header  {:>7.2} GH/s", effective_rate(header));
     println!("  message trailer   {:>7.2} GH/s", effective_rate(trailer));
-    println!("\nAverage search time");
+    println!("\nIdeal average at measured throughput");
     println!("  prefix       header      trailer");
     for digits in 7..=12 {
         let candidates = 16.0_f64.powi(digits);
@@ -643,7 +668,9 @@ fn run_benchmark(device: i32) -> Result<(), Box<dyn Error>> {
             human_duration(trailer_time)
         );
     }
-    println!("\nActual searches vary randomly; half finish within 69% of the average.");
+    println!(
+        "\nActual searches vary randomly; short searches also include batch and launch overhead."
+    );
     Ok(())
 }
 
@@ -687,13 +714,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut search_base = 0;
     let mut total_hashed = 0_u64;
     let expected_hashes = 2.0_f64.powi(target.bits() as i32) / args.carrier.eligible_fraction();
+    let batch_size = job.batch_size(target.bits());
     let candidate = loop {
-        let search_count = job.batch_size().min(job.domain_size() - search_base);
+        let search_count =
+            job.contiguous_count(search_base, batch_size.min(job.domain_size() - search_base));
         let result = job.search(&mut context, search_base, search_count)?;
+        total_hashed = total_hashed.saturating_add(result.candidates_hashed);
         if let Some(candidate) = result.candidate {
             break candidate;
         }
-        total_hashed = total_hashed.saturating_add(result.candidates_hashed);
         search_base += search_count;
         if search_base == job.domain_size() {
             epoch = epoch.checked_add(1).ok_or("nonce epoch overflow")?;
@@ -737,7 +766,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             parent.unwrap_or_else(|| "0000000000000000000000000000000000000000".to_owned());
         git_output(&["update-ref", "-m", &reflog, "HEAD", &object_id, &old_id])?;
     }
-    eprintln!("Found in {:.2?}", started.elapsed());
+    eprintln!(
+        "Found in {:.2?} after {} candidates ({:.2} GH/s)",
+        started.elapsed(),
+        total_hashed,
+        total_hashed as f64 / started.elapsed().as_secs_f64() / 1e9
+    );
     if args.update_ref {
         println!("[{object_id}] {subject}");
     } else {
@@ -755,7 +789,27 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{amended_author_ident, ident_parts, parse_author_identity};
+    use super::{
+        amended_author_ident, candidate_batch_size, ident_parts, parse_author_identity,
+        raw_outer_base, RAW_OUTER_DOMAIN, RAW_OUTER_START,
+    };
+
+    #[test]
+    fn search_batches_scale_with_target_width() {
+        assert_eq!(candidate_batch_size(4), 1 << 20);
+        assert_eq!(candidate_batch_size(20), 1 << 20);
+        assert_eq!(candidate_batch_size(24), 1 << 22);
+        assert_eq!(candidate_batch_size(28), 1 << 26);
+        assert_eq!(candidate_batch_size(32), 1 << 30);
+        assert_eq!(candidate_batch_size(48), 1 << 30);
+    }
+
+    #[test]
+    fn raw_domain_rotation_starts_with_nonzero_bytes_and_wraps() {
+        assert_eq!(raw_outer_base(0), RAW_OUTER_START);
+        assert_eq!(raw_outer_base(RAW_OUTER_DOMAIN - RAW_OUTER_START), 0);
+        assert_eq!(raw_outer_base(RAW_OUTER_DOMAIN - 1), RAW_OUTER_START - 1);
+    }
 
     #[test]
     fn parses_explicit_author_identity() {
