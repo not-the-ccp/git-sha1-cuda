@@ -45,8 +45,22 @@ struct RawSearchResult {
     billions_per_second: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawDeviceInfo {
+    abi_version: u32,
+    device: i32,
+    compute_major: i32,
+    compute_minor: i32,
+    multiprocessor_count: i32,
+    max_threads_per_block: i32,
+    global_memory_bytes: u64,
+    name: [c_char; 256],
+}
+
 const _: [(); 160] = [(); std::mem::size_of::<RawJob>()];
 const _: [(); 32] = [(); std::mem::size_of::<RawSearchResult>()];
+const _: [(); 288] = [(); std::mem::size_of::<RawDeviceInfo>()];
 
 #[repr(C)]
 struct RawContext {
@@ -55,6 +69,7 @@ struct RawContext {
 
 unsafe extern "C" {
     fn gsv_device_count() -> i32;
+    fn gsv_get_device_info(device: i32, info: *mut RawDeviceInfo) -> i32;
     fn gsv_job_init(
         job: *mut RawJob,
         prestate: *const u32,
@@ -142,6 +157,45 @@ pub fn device_count() -> Result<u32, CudaError> {
     } else {
         Ok(count as u32)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceInfo {
+    pub index: i32,
+    pub name: String,
+    pub compute_major: i32,
+    pub compute_minor: i32,
+    pub multiprocessor_count: i32,
+    pub max_threads_per_block: i32,
+    pub global_memory_bytes: u64,
+}
+
+pub fn device_info(device: i32) -> Result<DeviceInfo, CudaError> {
+    let mut raw = RawDeviceInfo {
+        abi_version: 0,
+        device: 0,
+        compute_major: 0,
+        compute_minor: 0,
+        multiprocessor_count: 0,
+        max_threads_per_block: 0,
+        global_memory_bytes: 0,
+        name: [0; 256],
+    };
+    let status = unsafe { gsv_get_device_info(device, &mut raw) };
+    if status != OK {
+        return Err(error(status, ptr::null()));
+    }
+    Ok(DeviceInfo {
+        index: raw.device,
+        name: unsafe { CStr::from_ptr(raw.name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned(),
+        compute_major: raw.compute_major,
+        compute_minor: raw.compute_minor,
+        multiprocessor_count: raw.multiprocessor_count,
+        max_threads_per_block: raw.max_threads_per_block,
+        global_memory_bytes: raw.global_memory_bytes,
+    })
 }
 
 #[derive(Clone, Copy)]

@@ -70,9 +70,23 @@ typedef struct gsv_search_result {
   float billions_per_second;
 } gsv_search_result;
 
+#define GSV_DEVICE_NAME_BYTES 256u
+
+typedef struct gsv_device_info {
+  uint32_t abi_version;
+  int32_t device;
+  int32_t compute_major;
+  int32_t compute_minor;
+  int32_t multiprocessor_count;
+  int32_t max_threads_per_block;
+  uint64_t global_memory_bytes;
+  char name[GSV_DEVICE_NAME_BYTES];
+} gsv_device_info;
+
 /* Library and device discovery. */
 GSV_API uint32_t gsv_abi_version(void);
 GSV_API int32_t gsv_device_count(void);
+GSV_API gsv_status gsv_get_device_info(int32_t device, gsv_device_info *info);
 
 /*
  * Fill derived fields (pre12, masks and H0 gate) and validate the layout.

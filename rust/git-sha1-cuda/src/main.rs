@@ -8,7 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use git_sha1_cuda::{Context, GitJob, PrintableHeaderJob, SearchResult, TargetPrefix};
+use git_sha1_cuda::{
+    device_count, device_info, Context, GitJob, PrintableHeaderJob, SearchResult, TargetPrefix,
+};
 
 const RAW_OUTER_BATCH: u64 = 1 << 22;
 const RAW_OUTER_DOMAIN: u64 = 1 << 32;
@@ -114,6 +116,7 @@ Create an unsigned Git commit whose SHA-1 begins with a chosen prefix.
 
 USAGE:
     git-sha1-cuda commit --prefix HEX -m MESSAGE [OPTIONS]
+    git-sha1-cuda devices
 
 OPTIONS:
     -p, --prefix HEX     Required leading hexadecimal digits (1 to 10)
@@ -381,7 +384,35 @@ fn prepare_job(
     })
 }
 
+fn list_devices() -> Result<(), Box<dyn Error>> {
+    let count = device_count()?;
+    if count == 0 {
+        println!("No CUDA devices found.");
+        return Ok(());
+    }
+    for index in 0..count {
+        let info = device_info(index as i32)?;
+        println!(
+            "{}  {}  sm_{}{}  {} SMs  {:.1} GiB",
+            info.index,
+            info.name,
+            info.compute_major,
+            info.compute_minor,
+            info.multiprocessor_count,
+            info.global_memory_bytes as f64 / (1_u64 << 30) as f64,
+        );
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
+    let mut top_level = env::args_os().skip(1);
+    if top_level.next().as_deref() == Some(std::ffi::OsStr::new("devices")) {
+        if top_level.next().is_some() {
+            return Err("devices takes no arguments".into());
+        }
+        return list_devices();
+    }
     let args = parse_args().map_err(|message| format!("{message}\n\n{}", usage()))?;
     let message = read_message(&args)?;
     let (payload, parent) = commit_payload(&message, args.allow_empty, args.amend)?;

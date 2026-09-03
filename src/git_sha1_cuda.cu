@@ -1563,6 +1563,35 @@ int32_t gsv_device_count(void) {
   return count;
 }
 
+gsv_status gsv_get_device_info(int32_t device, gsv_device_info *info) {
+  if (!info) {
+    set_error(nullptr, "device info pointer is null");
+    return GSV_INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> lock(g_cuda_mutex);
+  int count = 0;
+  cudaError_t e = cudaGetDeviceCount(&count);
+  if (e != cudaSuccess) return cuda_error(nullptr, e, "cudaGetDeviceCount");
+  if (device < 0 || device >= count) {
+    set_error(nullptr, "CUDA device index is out of range");
+    return GSV_INVALID_ARGUMENT;
+  }
+  cudaDeviceProp properties{};
+  e = cudaGetDeviceProperties(&properties, device);
+  if (e != cudaSuccess) return cuda_error(nullptr, e, "cudaGetDeviceProperties");
+  std::memset(info, 0, sizeof(*info));
+  info->abi_version = GSV_ABI_VERSION;
+  info->device = device;
+  info->compute_major = properties.major;
+  info->compute_minor = properties.minor;
+  info->multiprocessor_count = properties.multiProcessorCount;
+  info->max_threads_per_block = properties.maxThreadsPerBlock;
+  info->global_memory_bytes = properties.totalGlobalMem;
+  std::strncpy(info->name, properties.name, GSV_DEVICE_NAME_BYTES - 1);
+  g_last_error.clear();
+  return GSV_OK;
+}
+
 gsv_status gsv_job_init(gsv_job *job, const uint32_t prestate[5],
                         const uint32_t base_words[16], uint32_t target_bits,
                         const uint32_t target_words[5]) {

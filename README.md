@@ -36,6 +36,12 @@ git-sha1-cuda commit --prefix 0000000 -m "Implement the parser"
 exponentially more work. Multiple `-m` options create separate message
 paragraphs, and `--device N` selects a CUDA device.
 
+List available devices and their indices with:
+
+```bash
+git-sha1-cuda devices
+```
+
 `--carrier trailer` stores the nonce in an `X:` line at the end of the commit
 message. It is visible in normal Git and GitHub message views and searches
 about twice as fast as the default custom header:

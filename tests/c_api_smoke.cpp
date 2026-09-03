@@ -69,8 +69,18 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "no CUDA device: %s\n", gsv_last_error(nullptr));
     return 77;
   }
+  gsv_device_info device_info{};
+  gsv_status status = gsv_get_device_info(0, &device_info);
+  if (status != GSV_OK) return fail("device info", status);
+  if (device_info.abi_version != GSV_ABI_VERSION || device_info.device != 0 ||
+      device_info.compute_major < 1 || device_info.multiprocessor_count < 1 ||
+      device_info.max_threads_per_block < 1 || device_info.global_memory_bytes == 0 ||
+      device_info.name[0] == '\0') {
+    std::fprintf(stderr, "invalid CUDA device information\n");
+    return 1;
+  }
   gsv_job job{};
-  gsv_status status = gsv_job_init(&job, PRESTATE, BASE_WORDS, 160, EXPECTED);
+  status = gsv_job_init(&job, PRESTATE, BASE_WORDS, 160, EXPECTED);
   if (status != GSV_OK) return fail("job init", status);
   gsv_context *context = nullptr;
   status = gsv_context_create(0, &job, &context);
