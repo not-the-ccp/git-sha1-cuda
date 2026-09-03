@@ -16,6 +16,13 @@ struct CommitArgs {
     prefix: String,
     messages: Vec<String>,
     device: i32,
+    carrier: CommitCarrier,
+}
+
+#[derive(Clone, Copy)]
+enum CommitCarrier {
+    Header,
+    Trailer,
 }
 
 fn usage() -> &'static str {
@@ -28,6 +35,7 @@ USAGE:
 OPTIONS:
     -p, --prefix HEX     Required leading hexadecimal digits (1 to 10)
     -m, --message TEXT   Commit message; repeat for additional paragraphs
+        --carrier TYPE   Nonce location: header or trailer [default: header]
         --device N       CUDA device index [default: 0]
     -h, --help           Print help
     -V, --version        Print version
@@ -53,6 +61,7 @@ fn parse_args() -> Result<CommitArgs, String> {
     let mut prefix = None;
     let mut messages = Vec::new();
     let mut device = 0;
+    let mut carrier = CommitCarrier::Header;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-p" | "--prefix") => {
@@ -63,6 +72,13 @@ fn parse_args() -> Result<CommitArgs, String> {
                 device = value(&mut args, "--device")?
                     .parse()
                     .map_err(|_| "--device must be an integer".to_owned())?;
+            }
+            Some("--carrier") => {
+                carrier = match value(&mut args, "--carrier")?.as_str() {
+                    "header" => CommitCarrier::Header,
+                    "trailer" => CommitCarrier::Trailer,
+                    _ => return Err("--carrier must be header or trailer".to_owned()),
+                };
             }
             Some("-h" | "--help") => {
                 print!("{}", usage());
@@ -87,6 +103,7 @@ fn parse_args() -> Result<CommitArgs, String> {
         prefix,
         messages,
         device,
+        carrier,
     })
 }
 
@@ -177,7 +194,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args().map_err(|message| format!("{message}\n\n{}", usage()))?;
     let (payload, parent) = commit_payload(&args.messages)?;
     let target = TargetPrefix::from_hex(&args.prefix)?;
-    let job = GitJob::header(&payload, target)?;
+    let job = match args.carrier {
+        CommitCarrier::Header => GitJob::header(&payload, target)?,
+        CommitCarrier::Trailer => GitJob::message_trailer(&payload, target)?,
+    };
     let mut context = job.create_context(args.device)?;
 
     eprintln!(
