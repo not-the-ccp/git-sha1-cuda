@@ -70,6 +70,20 @@ git-sha1-cuda commit --prefix 0000000 -F message.txt --no-update-ref
 printf 'Automated commit\n' | git-sha1-cuda commit --prefix 0000000 -F -
 ```
 
+Append structured message metadata with repeated `--trailer` options. `--signoff`
+adds the current committer as `Signed-off-by`:
+
+```bash
+git-sha1-cuda commit --prefix 0000000 -m "Import the parser" \
+  --trailer "Reviewed-by=Ada <ada@example.com>" \
+  --trailer "Issue=42" \
+  --signoff
+```
+
+Trailer placement, separators, aliases, and duplicate handling are provided by
+`git interpret-trailers` and honor the repository's `trailer.*` configuration.
+With `--carrier trailer`, the mutable `X:` nonce follows these message trailers.
+
 `--allow-empty` permits a commit when the index has the same tree as `HEAD`.
 `--amend` replaces `HEAD` while preserving its author and parent set:
 

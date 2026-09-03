@@ -28,6 +28,8 @@ struct CommitArgs {
     prefix: String,
     messages: Vec<String>,
     message_file: Option<OsString>,
+    trailers: Vec<String>,
+    signoff: bool,
     device: i32,
     carrier: CommitCarrier,
     update_ref: bool,
@@ -234,6 +236,8 @@ OPTIONS:
     -p, --prefix HEX     Required leading hexadecimal digits (1 to 12)
     -m, --message TEXT   Commit message; repeat for additional paragraphs
     -F, --file PATH      Read the commit message from PATH, or stdin with -
+        --trailer T=V    Add a Git message trailer; repeat as needed
+    -s, --signoff        Add Signed-off-by for the committer
         --carrier TYPE   Nonce location: header or trailer [default: header]
         --device N       CUDA device index [default: 0]
         --no-update-ref  Write the commit object without advancing HEAD
@@ -304,6 +308,8 @@ fn parse_args() -> Result<CommitArgs, String> {
     let mut prefix = None;
     let mut messages = Vec::new();
     let mut message_file = None;
+    let mut trailers = Vec::new();
+    let mut signoff = false;
     let mut device = 0;
     let mut carrier = CommitCarrier::Header;
     let mut update_ref = true;
@@ -324,6 +330,8 @@ fn parse_args() -> Result<CommitArgs, String> {
             Some("-F" | "--file") => {
                 message_file = Some(value_os(&mut args, "--file")?);
             }
+            Some("--trailer") => trailers.push(value(&mut args, "--trailer")?),
+            Some("-s" | "--signoff") => signoff = true,
             Some("--device") => {
                 device = value(&mut args, "--device")?
                     .parse()
@@ -384,6 +392,8 @@ fn parse_args() -> Result<CommitArgs, String> {
         prefix,
         messages,
         message_file,
+        trailers,
+        signoff,
         device,
         carrier,
         update_ref,
@@ -495,6 +505,36 @@ fn current_committer_ident(date: Option<&str>) -> Result<Vec<u8>, Box<dyn Error>
     Ok(output.strip_suffix(b"\n").unwrap_or(&output).to_vec())
 }
 
+fn apply_message_trailers(
+    message: &[u8],
+    trailers: &[String],
+    signoff: bool,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    if trailers.is_empty() && !signoff {
+        return Ok(message.to_vec());
+    }
+
+    let mut additions = trailers.to_vec();
+    if signoff {
+        let committer = current_committer_ident(None)?;
+        let (identity, _) = ident_parts(&committer)?;
+        additions.push(format!(
+            "Signed-off-by={}",
+            String::from_utf8(identity.to_vec())?
+        ));
+    }
+    let mut arguments = vec!["interpret-trailers"];
+    for trailer in &additions {
+        arguments.push("--trailer");
+        arguments.push(trailer);
+    }
+    let mut input = message.to_vec();
+    if !input.ends_with(b"\n") {
+        input.push(b'\n');
+    }
+    git_input_bytes(&arguments, &input)
+}
+
 fn ident_parts(ident: &[u8]) -> Result<IdentParts<'_>, Box<dyn Error>> {
     let close = ident
         .iter()
@@ -588,7 +628,7 @@ fn git_optional(arguments: &[&str]) -> Result<Option<String>, Box<dyn Error>> {
     }
 }
 
-fn git_input(arguments: &[&str], input: &[u8]) -> Result<String, Box<dyn Error>> {
+fn git_input_bytes(arguments: &[&str], input: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut child = Command::new("git")
         .args(arguments)
         .stdin(Stdio::piped())
@@ -601,7 +641,13 @@ fn git_input(arguments: &[&str], input: &[u8]) -> Result<String, Box<dyn Error>>
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git {} failed: {}", arguments.join(" "), detail.trim()).into());
     }
-    Ok(String::from_utf8(output.stdout)?.trim_end().to_owned())
+    Ok(output.stdout)
+}
+
+fn git_input(arguments: &[&str], input: &[u8]) -> Result<String, Box<dyn Error>> {
+    Ok(String::from_utf8(git_input_bytes(arguments, input)?)?
+        .trim_end()
+        .to_owned())
 }
 
 fn git_path(name: &str) -> Result<std::path::PathBuf, Box<dyn Error>> {
@@ -898,7 +944,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             return Err("resume token prefix does not match --prefix".into());
         }
     }
-    let message = read_message(&args)?;
+    let message = apply_message_trailers(&read_message(&args)?, &args.trailers, args.signoff)?;
     let author_date = resume
         .as_ref()
         .map_or(args.author_date.as_deref(), |point| {
@@ -1046,9 +1092,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        amended_author_ident, candidate_batch_size, ident_parts, parse_author_identity,
-        parse_resume_token, raw_outer_base, resume_token, CommitCarrier, RAW_OUTER_DOMAIN,
-        RAW_OUTER_START,
+        amended_author_ident, apply_message_trailers, candidate_batch_size, ident_parts,
+        parse_author_identity, parse_resume_token, raw_outer_base, resume_token, CommitCarrier,
+        RAW_OUTER_DOMAIN, RAW_OUTER_START,
     };
 
     #[test]
@@ -1102,6 +1148,35 @@ committer Grace <grace@example.com> 1234567891 -0700\n\nmessage\n";
     }
 
     #[test]
+    fn git_formats_repeated_message_trailers() {
+        let result = apply_message_trailers(
+            b"Subject\n\nBody\n",
+            &[
+                "Reviewed-by=Ada <ada@example.com>".to_owned(),
+                "Acked-by=Grace <grace@example.com>".to_owned(),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            b"Subject\n\nBody\n\nReviewed-by: Ada <ada@example.com>\n\
+Acked-by: Grace <grace@example.com>\n"
+        );
+    }
+
+    #[test]
+    fn git_avoids_an_identical_trailer() {
+        let result = apply_message_trailers(
+            b"Subject\n\nReviewed-by: Ada <ada@example.com>\n",
+            &["Reviewed-by=Ada <ada@example.com>".to_owned()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(result, b"Subject\n\nReviewed-by: Ada <ada@example.com>\n");
+    }
+
+    #[test]
     fn parses_explicit_author_identity() {
         assert_eq!(
             parse_author_identity("Ada Lovelace <ada@example.com>").unwrap(),
@@ -1121,6 +1196,12 @@ committer Grace <grace@example.com> 1234567891 -0700\n\nmessage\n";
                 b"1234567890 +0130".as_slice()
             )
         );
+    }
+
+    #[test]
+    fn trailer_block_is_separated_from_a_message_without_newline() {
+        let result = apply_message_trailers(b"Subject", &["Issue=42".to_owned()], false).unwrap();
+        assert_eq!(result, b"Subject\n\nIssue: 42\n");
     }
 
     #[test]
