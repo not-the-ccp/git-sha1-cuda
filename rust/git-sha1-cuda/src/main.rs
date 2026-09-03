@@ -26,6 +26,7 @@ struct CommitArgs {
     update_ref: bool,
     allow_empty: bool,
     amend: bool,
+    start_epoch: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -119,7 +120,7 @@ USAGE:
     git-sha1-cuda devices
 
 OPTIONS:
-    -p, --prefix HEX     Required leading hexadecimal digits (1 to 10)
+    -p, --prefix HEX     Required leading hexadecimal digits (1 to 12)
     -m, --message TEXT   Commit message; repeat for additional paragraphs
     -F, --file PATH      Read the commit message from PATH, or stdin with -
         --carrier TYPE   Nonce location: header or trailer [default: header]
@@ -127,6 +128,7 @@ OPTIONS:
         --no-update-ref  Write the commit object without advancing HEAD
         --allow-empty    Create a commit when the index tree is unchanged
         --amend          Replace HEAD while preserving its author and parents
+        --start-epoch N  Begin with nonce epoch N [default: 0]
     -h, --help           Print help
     -V, --version        Print version
 "#
@@ -157,6 +159,7 @@ fn parse_args() -> Result<CommitArgs, String> {
     let mut update_ref = true;
     let mut allow_empty = false;
     let mut amend = false;
+    let mut start_epoch = 0;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-p" | "--prefix") => {
@@ -181,6 +184,11 @@ fn parse_args() -> Result<CommitArgs, String> {
             Some("--no-update-ref") => update_ref = false,
             Some("--allow-empty") => allow_empty = true,
             Some("--amend") => amend = true,
+            Some("--start-epoch") => {
+                start_epoch = value(&mut args, "--start-epoch")?
+                    .parse()
+                    .map_err(|_| "--start-epoch must be an unsigned integer".to_owned())?;
+            }
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 std::process::exit(0);
@@ -194,8 +202,8 @@ fn parse_args() -> Result<CommitArgs, String> {
     }
     let prefix = prefix.ok_or_else(|| "--prefix is required".to_owned())?;
     let digits = prefix.strip_prefix("0x").unwrap_or(&prefix);
-    if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("--prefix must contain 1 to 10 hexadecimal digits".to_owned());
+    if digits.is_empty() || digits.len() > 12 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("--prefix must contain 1 to 12 hexadecimal digits".to_owned());
     }
     if !messages.is_empty() && message_file.is_some() {
         return Err("-m/--message and -F/--file cannot be combined".to_owned());
@@ -212,6 +220,7 @@ fn parse_args() -> Result<CommitArgs, String> {
         update_ref,
         allow_empty,
         amend,
+        start_epoch,
     })
 }
 
@@ -417,7 +426,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let message = read_message(&args)?;
     let (payload, parent) = commit_payload(&message, args.allow_empty, args.amend)?;
     let target = TargetPrefix::from_hex(&args.prefix)?;
-    let mut epoch = 0_u64;
+    let mut epoch = args.start_epoch;
     let mut job = prepare_job(&payload, target, args.carrier, epoch)?;
     let mut context = job.create_context(args.device)?;
 

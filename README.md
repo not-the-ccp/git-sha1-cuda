@@ -32,7 +32,7 @@ git add src/main.rs
 git-sha1-cuda commit --prefix 0000000 -m "Implement the parser"
 ```
 
-`--prefix` accepts one to ten hexadecimal digits. Longer prefixes take
+`--prefix` accepts one to twelve hexadecimal digits. Longer prefixes take
 exponentially more work. Multiple `-m` options create separate message
 paragraphs, and `--device N` selects a CUDA device.
 
@@ -86,6 +86,10 @@ The CLI automatically starts a fresh nonce epoch when a complete 40-bit domain
 contains no eligible match. Progress reports show the probability that a match
 would have appeared after the work completed so far.
 
+Use `--start-epoch N` to resume at a later completed epoch. An epoch covers one
+40-bit candidate domain and takes about 3 minutes 38 seconds with the default
+header carrier on the measured RTX 4060.
+
 ## Search time
 
 Measurements on a GeForce RTX 4060 with CUDA 13.3:
@@ -107,6 +111,8 @@ header kernel.
 | 8 | 0.85 s | 2.6 s |
 | 9 | 14 s | 41 s |
 | 10 | 3 min 38 s | 10 min 53 s |
+| 11 | 58 min | 2 h 54 min |
+| 12 | 15 h 29 min | 46 h 27 min |
 
 Search time follows a geometric distribution. The median is about 69% of the
 average, so individual runs vary considerably.
