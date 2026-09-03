@@ -118,6 +118,7 @@ Create an unsigned Git commit whose SHA-1 begins with a chosen prefix.
 USAGE:
     git-sha1-cuda commit --prefix HEX -m MESSAGE [OPTIONS]
     git-sha1-cuda devices
+    git-sha1-cuda benchmark [--device N]
 
 OPTIONS:
     -p, --prefix HEX     Required leading hexadecimal digits (1 to 12)
@@ -133,6 +134,41 @@ OPTIONS:
     -V, --version        Print version
 "#
     )
+}
+
+fn parse_benchmark_args() -> Result<i32, String> {
+    let mut args = env::args_os().skip(2);
+    let mut device = 0;
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--device") => {
+                device = value(&mut args, "--device")?
+                    .parse()
+                    .map_err(|_| "--device must be an integer".to_owned())?;
+            }
+            Some("-h" | "--help") => {
+                print!(
+                    r#"Measure commit-search throughput on both nonce carriers.
+
+USAGE:
+    git-sha1-cuda benchmark [--device N]
+
+OPTIONS:
+        --device N  CUDA device index [default: 0]
+    -h, --help      Print help
+"#
+                );
+                std::process::exit(0);
+            }
+            _ => {
+                return Err(format!(
+                    "unknown benchmark option: {}",
+                    arg.to_string_lossy()
+                ))
+            }
+        }
+    }
+    Ok(device)
 }
 
 fn parse_args() -> Result<CommitArgs, String> {
@@ -414,13 +450,103 @@ fn list_devices() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct BenchmarkResult {
+    carrier: CommitCarrier,
+    billions_per_second: f64,
+}
+
+fn benchmark_carrier(
+    device: i32,
+    carrier: CommitCarrier,
+) -> Result<BenchmarkResult, Box<dyn Error>> {
+    const PAYLOAD: &[u8] = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+author Benchmark <benchmark@localhost> 0 +0000\n\
+committer Benchmark <benchmark@localhost> 0 +0000\n\n\
+benchmark\n";
+    const SAMPLES: u64 = 3;
+
+    let target = TargetPrefix::from_hex("ffffffffffffffffffffffffffffffffffffffff")?;
+    let job = prepare_job(PAYLOAD, target, carrier, 0)?;
+    let mut context = job.create_context(device)?;
+    let batch = job.batch_size();
+
+    // Warm up CUDA context initialization, code loading, and clock ramp-up.
+    let _ = job.search(&mut context, 0, batch)?;
+
+    let mut candidates = 0_u64;
+    let mut milliseconds = 0.0_f64;
+    for sample in 0..SAMPLES {
+        let base = sample * batch;
+        let result = job.search(&mut context, base, batch)?;
+        if result.candidate.is_some() {
+            return Err("benchmark unexpectedly found the 160-bit sentinel target".into());
+        }
+        candidates = candidates.saturating_add(result.candidates_hashed);
+        milliseconds += f64::from(result.milliseconds);
+    }
+    Ok(BenchmarkResult {
+        carrier,
+        billions_per_second: candidates as f64 / milliseconds / 1.0e6,
+    })
+}
+
+fn human_duration(seconds: f64) -> String {
+    if seconds < 0.001 {
+        format!("{:.0} us", seconds * 1_000_000.0)
+    } else if seconds < 1.0 {
+        format!("{:.1} ms", seconds * 1_000.0)
+    } else if seconds < 60.0 {
+        format!("{seconds:.1} s")
+    } else if seconds < 3_600.0 {
+        format!("{:.1} min", seconds / 60.0)
+    } else {
+        format!("{:.1} h", seconds / 3_600.0)
+    }
+}
+
+fn run_benchmark(device: i32) -> Result<(), Box<dyn Error>> {
+    let info = device_info(device)?;
+    eprintln!("Benchmarking {} (CUDA device {})...", info.name, device);
+    let header = benchmark_carrier(device, CommitCarrier::Header)?;
+    let trailer = benchmark_carrier(device, CommitCarrier::Trailer)?;
+    let effective_rate =
+        |result: BenchmarkResult| result.billions_per_second * result.carrier.eligible_fraction();
+
+    println!("\nThroughput");
+    println!("  printable header  {:>7.2} GH/s", effective_rate(header));
+    println!("  message trailer   {:>7.2} GH/s", effective_rate(trailer));
+    println!("\nAverage search time");
+    println!("  prefix       header      trailer");
+    for digits in 7..=12 {
+        let candidates = 16.0_f64.powi(digits);
+        let header_time = candidates / (effective_rate(header) * 1.0e9);
+        let trailer_time = candidates / (effective_rate(trailer) * 1.0e9);
+        println!(
+            "  {digits:>2} hex   {:>10}   {:>10}",
+            human_duration(header_time),
+            human_duration(trailer_time)
+        );
+    }
+    println!("\nActual searches vary randomly; half finish within 69% of the average.");
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let mut top_level = env::args_os().skip(1);
-    if top_level.next().as_deref() == Some(std::ffi::OsStr::new("devices")) {
-        if top_level.next().is_some() {
-            return Err("devices takes no arguments".into());
+    match top_level.next().as_deref() {
+        Some(command) if command == "devices" => {
+            if top_level.next().is_some() {
+                return Err("devices takes no arguments".into());
+            }
+            return list_devices();
         }
-        return list_devices();
+        Some(command) if command == "benchmark" => {
+            let device =
+                parse_benchmark_args().map_err(|message| format!("{message}\n\n{}", usage()))?;
+            return run_benchmark(device);
+        }
+        _ => {}
     }
     let args = parse_args().map_err(|message| format!("{message}\n\n{}", usage()))?;
     let message = read_message(&args)?;

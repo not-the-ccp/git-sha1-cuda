@@ -42,6 +42,17 @@ List available devices and their indices with:
 git-sha1-cuda devices
 ```
 
+Measure both search methods on the selected GPU with:
+
+```bash
+git-sha1-cuda benchmark
+git-sha1-cuda benchmark --device 1
+```
+
+The benchmark reports effective throughput and average search times for
+prefixes from 7 to 12 hexadecimal digits. It also provides a quick end-to-end
+check of the CUDA driver, native library, and both kernels.
+
 `--carrier trailer` stores the nonce in an `X:` line at the end of the commit
 message. It is visible in normal Git and GitHub message views and searches
 about twice as fast as the default custom header:
