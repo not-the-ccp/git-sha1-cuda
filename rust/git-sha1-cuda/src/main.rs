@@ -16,6 +16,7 @@ const RAW_OUTER_BATCH: u64 = 1 << 22;
 const RAW_OUTER_DOMAIN: u64 = 1 << 32;
 const PRINTABLE_BATCH: u64 = 1 << 30;
 const PRINTABLE_DOMAIN: u64 = 1 << 40;
+type IdentParts<'a> = (&'a [u8], &'a [u8]);
 
 struct CommitArgs {
     prefix: String,
@@ -26,6 +27,9 @@ struct CommitArgs {
     update_ref: bool,
     allow_empty: bool,
     amend: bool,
+    author: Option<String>,
+    author_date: Option<String>,
+    reset_author: bool,
     start_epoch: u64,
 }
 
@@ -129,6 +133,9 @@ OPTIONS:
         --no-update-ref  Write the commit object without advancing HEAD
         --allow-empty    Create a commit when the index tree is unchanged
         --amend          Replace HEAD while preserving its author and parents
+        --author IDENT   Set the author as "Name <email>"
+        --date DATE      Set the author date using a Git date expression
+        --reset-author   Reset author identity and date when amending
         --start-epoch N  Begin with nonce epoch N [default: 0]
     -h, --help           Print help
     -V, --version        Print version
@@ -195,6 +202,9 @@ fn parse_args() -> Result<CommitArgs, String> {
     let mut update_ref = true;
     let mut allow_empty = false;
     let mut amend = false;
+    let mut author = None;
+    let mut author_date = None;
+    let mut reset_author = false;
     let mut start_epoch = 0;
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -220,6 +230,9 @@ fn parse_args() -> Result<CommitArgs, String> {
             Some("--no-update-ref") => update_ref = false,
             Some("--allow-empty") => allow_empty = true,
             Some("--amend") => amend = true,
+            Some("--author") => author = Some(value(&mut args, "--author")?),
+            Some("--date") => author_date = Some(value(&mut args, "--date")?),
+            Some("--reset-author") => reset_author = true,
             Some("--start-epoch") => {
                 start_epoch = value(&mut args, "--start-epoch")?
                     .parse()
@@ -247,6 +260,12 @@ fn parse_args() -> Result<CommitArgs, String> {
     if messages.is_empty() && message_file.is_none() {
         return Err("-m/--message or -F/--file is required".to_owned());
     }
+    if reset_author && !amend {
+        return Err("--reset-author requires --amend".to_owned());
+    }
+    if reset_author && (author.is_some() || author_date.is_some()) {
+        return Err("--reset-author cannot be combined with --author or --date".to_owned());
+    }
     Ok(CommitArgs {
         prefix,
         messages,
@@ -256,6 +275,9 @@ fn parse_args() -> Result<CommitArgs, String> {
         update_ref,
         allow_empty,
         amend,
+        author,
+        author_date,
+        reset_author,
         start_epoch,
     })
 }
@@ -302,6 +324,93 @@ fn git_bytes(arguments: &[&str]) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(output.stdout)
 }
 
+fn git_bytes_with_env(
+    arguments: &[&str],
+    variables: &[(&str, &str)],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let output = Command::new("git")
+        .args(arguments)
+        .envs(variables.iter().copied())
+        .output()?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git {} failed: {}", arguments.join(" "), detail.trim()).into());
+    }
+    Ok(output.stdout)
+}
+
+fn parse_author_identity(author: &str) -> Result<(&str, &str), Box<dyn Error>> {
+    if author.contains(['\0', '\n', '\r']) || !author.ends_with('>') {
+        return Err("--author must have the form Name <email>".into());
+    }
+    let separator = author
+        .rfind(" <")
+        .ok_or("--author must have the form Name <email>")?;
+    let name = &author[..separator];
+    let email = &author[separator + 2..author.len() - 1];
+    if name.is_empty() || email.is_empty() || email.contains(['<', '>']) {
+        return Err("--author must have the form Name <email>".into());
+    }
+    Ok((name, email))
+}
+
+fn current_author_ident(
+    author: Option<&str>,
+    date: Option<&str>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut variables = Vec::with_capacity(3);
+    if let Some(author) = author {
+        let (name, email) = parse_author_identity(author)?;
+        variables.push(("GIT_AUTHOR_NAME", name));
+        variables.push(("GIT_AUTHOR_EMAIL", email));
+    }
+    if let Some(date) = date {
+        if date.contains(['\0', '\n', '\r']) {
+            return Err("--date contains an invalid character".into());
+        }
+        variables.push(("GIT_AUTHOR_DATE", date));
+    }
+    let output = git_bytes_with_env(&["var", "GIT_AUTHOR_IDENT"], &variables)?;
+    Ok(output.strip_suffix(b"\n").unwrap_or(&output).to_vec())
+}
+
+fn ident_parts(ident: &[u8]) -> Result<IdentParts<'_>, Box<dyn Error>> {
+    let close = ident
+        .iter()
+        .rposition(|byte| *byte == b'>')
+        .ok_or("author identity has no closing email bracket")?;
+    if close + 2 > ident.len() || ident.get(close + 1) != Some(&b' ') {
+        return Err("author identity has no date".into());
+    }
+    Ok((&ident[..=close], &ident[close + 2..]))
+}
+
+fn amended_author_ident(
+    original: &[u8],
+    author: Option<&str>,
+    date: Option<&str>,
+    reset: bool,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    if reset {
+        return current_author_ident(None, None);
+    }
+    if author.is_none() && date.is_none() {
+        return Ok(original.to_vec());
+    }
+    let replacement = current_author_ident(author, date)?;
+    let (old_identity, old_date) = ident_parts(original)?;
+    let (new_identity, new_date) = ident_parts(&replacement)?;
+    let mut result = Vec::new();
+    result.extend_from_slice(if author.is_some() {
+        new_identity
+    } else {
+        old_identity
+    });
+    result.push(b' ');
+    result.extend_from_slice(if date.is_some() { new_date } else { old_date });
+    Ok(result)
+}
+
 fn git_output(arguments: &[&str]) -> Result<String, Box<dyn Error>> {
     Ok(String::from_utf8(git_bytes(arguments)?)?
         .trim_end()
@@ -339,6 +448,9 @@ fn commit_payload(
     message: &[u8],
     allow_empty: bool,
     amend: bool,
+    author_override: Option<&str>,
+    author_date: Option<&str>,
+    reset_author: bool,
 ) -> Result<(Vec<u8>, Option<String>), Box<dyn Error>> {
     git_output(&["rev-parse", "--git-dir"])?;
     let format = git_output(&["rev-parse", "--show-object-format"])?;
@@ -374,10 +486,13 @@ fn commit_payload(
             .split(|byte| *byte == b'\n')
             .filter_map(|line| line.strip_prefix(b"parent ").map(|parent| parent.to_vec()))
             .collect::<Vec<_>>();
-        (author, parents)
+        (
+            amended_author_ident(&author, author_override, author_date, reset_author)?,
+            parents,
+        )
     } else {
         (
-            git_output(&["var", "GIT_AUTHOR_IDENT"])?.into_bytes(),
+            current_author_ident(author_override, author_date)?,
             head.iter()
                 .map(|parent| parent.as_bytes().to_vec())
                 .collect(),
@@ -550,7 +665,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let args = parse_args().map_err(|message| format!("{message}\n\n{}", usage()))?;
     let message = read_message(&args)?;
-    let (payload, parent) = commit_payload(&message, args.allow_empty, args.amend)?;
+    let (payload, parent) = commit_payload(
+        &message,
+        args.allow_empty,
+        args.amend,
+        args.author.as_deref(),
+        args.author_date.as_deref(),
+        args.reset_author,
+    )?;
     let target = TargetPrefix::from_hex(&args.prefix)?;
     let mut epoch = args.start_epoch;
     let mut job = prepare_job(&payload, target, args.carrier, epoch)?;
@@ -628,5 +750,41 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{amended_author_ident, ident_parts, parse_author_identity};
+
+    #[test]
+    fn parses_explicit_author_identity() {
+        assert_eq!(
+            parse_author_identity("Ada Lovelace <ada@example.com>").unwrap(),
+            ("Ada Lovelace", "ada@example.com")
+        );
+        assert!(parse_author_identity("Ada Lovelace").is_err());
+        assert!(parse_author_identity("<ada@example.com>").is_err());
+        assert!(parse_author_identity("Ada <>").is_err());
+    }
+
+    #[test]
+    fn splits_git_identity_and_date() {
+        assert_eq!(
+            ident_parts(b"Ada Lovelace <ada@example.com> 1234567890 +0130").unwrap(),
+            (
+                b"Ada Lovelace <ada@example.com>".as_slice(),
+                b"1234567890 +0130".as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn amend_preserves_original_author_by_default() {
+        let original = b"Original <original@example.com> 1234567890 +0130";
+        assert_eq!(
+            amended_author_ident(original, None, None, false).unwrap(),
+            original
+        );
     }
 }

@@ -77,11 +77,22 @@ printf 'Automated commit\n' | git-sha1-cuda commit --prefix 0000000 -F -
 git-sha1-cuda commit --amend --prefix 0000000 -m "Revised message"
 ```
 
+Set commit authorship with the identity and date forms used by Git:
+
+```bash
+git-sha1-cuda commit --prefix 0000000 -m "Import the archive" \
+  --author "Ada Lovelace <ada@example.com>" \
+  --date "2025-01-02 15:04:05 +0100"
+```
+
+During `--amend`, `--author` and `--date` replace their respective original
+fields. `--reset-author` replaces both with the current Git author and time.
+
 The command uses:
 
 - the tree represented by the current Git index;
 - the current `HEAD` as its single parent, when present;
-- author and committer identities resolved by `git var`;
+- author and committer identities resolved through Git, with optional author overrides;
 - the time at which the command starts;
 - the first available matching candidate from the GPU search.
 
