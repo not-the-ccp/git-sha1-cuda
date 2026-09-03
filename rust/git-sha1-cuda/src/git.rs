@@ -700,10 +700,10 @@ visible subject\n";
         assert_eq!(job.suffix_blocks(), 1);
         assert_eq!(job.filler_bytes(), 40);
         assert_eq!(
-            job.verify_candidate(0x6162_6364_65).unwrap(),
+            job.verify_candidate(0x0061_6263_6465).unwrap(),
             target.aligned_bytes()
         );
-        let payload = job.materialize_payload(0x6162_6364_65).unwrap();
+        let payload = job.materialize_payload(0x0061_6263_6465).unwrap();
         let headers = &payload[..payload.windows(2).position(|x| x == b"\n\n").unwrap()];
         assert!(headers.windows(3).any(|x| x == b"\nx "));
         assert!(headers.ends_with(b"abcde"));
@@ -732,11 +732,11 @@ visible subject\n";
             *b"????????"
         );
         assert_eq!(
-            printable_candidate_bytes(0x1234_5678_9a).unwrap(),
+            printable_candidate_bytes(0x0012_3456_789a).unwrap(),
             *b"\"(:%,>$:"
         );
         assert_eq!(
-            job.verify_candidate(0x1234_5678_9a).unwrap(),
+            job.verify_candidate(0x0012_3456_789a).unwrap(),
             target.aligned_bytes()
         );
     }
@@ -749,14 +749,14 @@ visible subject\n";
         let target = TargetPrefix::from_hex("894dbe83f20d4815fde83abb8582b2cc7b4b696c").unwrap();
         let job = PrintableHeaderJob::header(COMMIT, target).unwrap();
         let mut context = job.create_context(0).unwrap();
-        let words = context.digest_masked_header(0x1234_5678_9a).unwrap();
+        let words = context.digest_masked_header(0x0012_3456_789a).unwrap();
         let mut digest = [0; 20];
         for (bytes, word) in digest.chunks_exact_mut(4).zip(words) {
             bytes.copy_from_slice(&word.to_be_bytes());
         }
-        assert_eq!(digest, job.digest(0x1234_5678_9a).unwrap());
-        let result = context.search_masked_header(0x1234_5678_9a, 1).unwrap();
-        assert_eq!(result.candidate, Some(0x1234_5678_9a));
+        assert_eq!(digest, job.digest(0x0012_3456_789a).unwrap());
+        let result = context.search_masked_header(0x0012_3456_789a, 1).unwrap();
+        assert_eq!(result.candidate, Some(0x0012_3456_789a));
     }
 
     #[test]
@@ -768,8 +768,8 @@ visible subject\n";
         assert_eq!(second.nonce_object_offset() % 64, 48);
         assert_ne!(first.object_template(), second.object_template());
         assert_ne!(
-            first.digest(0x6162_6364_65).unwrap(),
-            second.digest(0x6162_6364_65).unwrap()
+            first.digest(0x0061_6263_6465).unwrap(),
+            second.digest(0x0061_6263_6465).unwrap()
         );
     }
 
@@ -791,24 +791,24 @@ visible subject\n";
         let target = TargetPrefix::from_hex("fb542602a40a02bb2fe6613a1ca13d7489d83246").unwrap();
         let job = GitJob::header(COMMIT, target).unwrap();
         let mut context = job.create_context(0).unwrap();
-        let words = context.digest(0x6162_6364_65).unwrap();
+        let words = context.digest(0x0061_6263_6465).unwrap();
         let mut digest = [0; 20];
         for (bytes, word) in digest.chunks_exact_mut(4).zip(words) {
             bytes.copy_from_slice(&word.to_be_bytes());
         }
-        assert_eq!(digest, job.digest(0x6162_6364_65).unwrap());
+        assert_eq!(digest, job.digest(0x0061_6263_6465).unwrap());
         let result = context.search(0x6162_6364, 1).unwrap();
-        assert_eq!(result.candidate, Some(0x6162_6364_65));
+        assert_eq!(result.candidate, Some(0x0061_6263_6465));
 
         let mut long_commit = COMMIT.to_vec();
         long_commit.extend(std::iter::repeat_n(b'z', 512));
         let planning = GitJob::header(&long_commit, TargetPrefix::from_hex("0").unwrap()).unwrap();
-        let expected = planning.digest(0x6162_6364_65).unwrap();
+        let expected = planning.digest(0x0061_6263_6465).unwrap();
         let target = TargetPrefix::from_digest(expected, 160).unwrap();
         let long_job = GitJob::header(&long_commit, target).unwrap();
         assert!(long_job.suffix_blocks() > 1);
         let mut long_context = long_job.create_context(0).unwrap();
-        let words = long_context.digest(0x6162_6364_65).unwrap();
+        let words = long_context.digest(0x0061_6263_6465).unwrap();
         let mut actual = [0; 20];
         for (bytes, word) in actual.chunks_exact_mut(4).zip(words) {
             bytes.copy_from_slice(&word.to_be_bytes());
