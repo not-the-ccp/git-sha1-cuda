@@ -2,7 +2,8 @@ use std::{
     env,
     error::Error,
     ffi::OsString,
-    io::Write,
+    fs,
+    io::{self, Read, Write},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -15,8 +16,10 @@ const OUTER_DOMAIN: u64 = 1 << 32;
 struct CommitArgs {
     prefix: String,
     messages: Vec<String>,
+    message_file: Option<OsString>,
     device: i32,
     carrier: CommitCarrier,
+    update_ref: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -35,8 +38,10 @@ USAGE:
 OPTIONS:
     -p, --prefix HEX     Required leading hexadecimal digits (1 to 10)
     -m, --message TEXT   Commit message; repeat for additional paragraphs
+    -F, --file PATH      Read the commit message from PATH, or stdin with -
         --carrier TYPE   Nonce location: header or trailer [default: header]
         --device N       CUDA device index [default: 0]
+        --no-update-ref  Write the commit object without advancing HEAD
     -h, --help           Print help
     -V, --version        Print version
 "#
@@ -60,14 +65,19 @@ fn parse_args() -> Result<CommitArgs, String> {
 
     let mut prefix = None;
     let mut messages = Vec::new();
+    let mut message_file = None;
     let mut device = 0;
     let mut carrier = CommitCarrier::Header;
+    let mut update_ref = true;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-p" | "--prefix") => {
                 prefix = Some(value(&mut args, "--prefix")?);
             }
             Some("-m" | "--message") => messages.push(value(&mut args, "--message")?),
+            Some("-F" | "--file") => {
+                message_file = Some(value_os(&mut args, "--file")?);
+            }
             Some("--device") => {
                 device = value(&mut args, "--device")?
                     .parse()
@@ -80,6 +90,7 @@ fn parse_args() -> Result<CommitArgs, String> {
                     _ => return Err("--carrier must be header or trailer".to_owned()),
                 };
             }
+            Some("--no-update-ref") => update_ref = false,
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 std::process::exit(0);
@@ -96,15 +107,46 @@ fn parse_args() -> Result<CommitArgs, String> {
     if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("--prefix must contain 1 to 10 hexadecimal digits".to_owned());
     }
-    if messages.is_empty() || messages.iter().all(|message| message.is_empty()) {
-        return Err("at least one non-empty -m/--message is required".to_owned());
+    if !messages.is_empty() && message_file.is_some() {
+        return Err("-m/--message and -F/--file cannot be combined".to_owned());
+    }
+    if messages.is_empty() && message_file.is_none() {
+        return Err("-m/--message or -F/--file is required".to_owned());
     }
     Ok(CommitArgs {
         prefix,
         messages,
+        message_file,
         device,
         carrier,
+        update_ref,
     })
+}
+
+fn value_os(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<OsString, String> {
+    args.next()
+        .ok_or_else(|| format!("{option} requires a value"))
+}
+
+fn read_message(args: &CommitArgs) -> Result<Vec<u8>, Box<dyn Error>> {
+    let message = if let Some(path) = &args.message_file {
+        if path == "-" {
+            let mut bytes = Vec::new();
+            io::stdin().read_to_end(&mut bytes)?;
+            bytes
+        } else {
+            fs::read(path)?
+        }
+    } else {
+        args.messages.join("\n\n").into_bytes()
+    };
+    if message.is_empty() {
+        return Err("commit message is empty".into());
+    }
+    if message.contains(&0) {
+        return Err("commit message contains NUL".into());
+    }
+    Ok(message)
 }
 
 fn value(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<String, String> {
@@ -150,7 +192,7 @@ fn git_input(arguments: &[&str], input: &[u8]) -> Result<String, Box<dyn Error>>
     Ok(String::from_utf8(output.stdout)?.trim_end().to_owned())
 }
 
-fn commit_payload(messages: &[String]) -> Result<(Vec<u8>, Option<String>), Box<dyn Error>> {
+fn commit_payload(message: &[u8]) -> Result<(Vec<u8>, Option<String>), Box<dyn Error>> {
     git_output(&["rev-parse", "--git-dir"])?;
     let format = git_output(&["rev-parse", "--show-object-format"])?;
     if format != "sha1" {
@@ -167,14 +209,12 @@ fn commit_payload(messages: &[String]) -> Result<(Vec<u8>, Option<String>), Box<
     }
     let author = git_output(&["var", "GIT_AUTHOR_IDENT"])?;
     let committer = git_output(&["var", "GIT_COMMITTER_IDENT"])?;
-    let message = messages.join("\n\n");
-
     let mut payload = format!("tree {tree}\n").into_bytes();
     if let Some(parent_id) = &parent {
         payload.extend_from_slice(format!("parent {parent_id}\n").as_bytes());
     }
     payload.extend_from_slice(format!("author {author}\ncommitter {committer}\n\n").as_bytes());
-    payload.extend_from_slice(message.as_bytes());
+    payload.extend_from_slice(message);
     if !payload.ends_with(b"\n") {
         payload.push(b'\n');
     }
@@ -192,7 +232,8 @@ fn hex_digest(digest: &[u8; 20]) -> String {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args().map_err(|message| format!("{message}\n\n{}", usage()))?;
-    let (payload, parent) = commit_payload(&args.messages)?;
+    let message = read_message(&args)?;
+    let (payload, parent) = commit_payload(&message)?;
     let target = TargetPrefix::from_hex(&args.prefix)?;
     let job = match args.carrier {
         CommitCarrier::Header => GitJob::header(&payload, target)?,
@@ -241,12 +282,23 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let old_id = parent.unwrap_or_else(|| "0000000000000000000000000000000000000000".to_owned());
-    let subject = args.messages[0].lines().next().unwrap_or("");
+    let subject_bytes = message
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let subject = String::from_utf8_lossy(subject_bytes);
     let reflog = format!("commit: {subject}");
-    git_output(&["update-ref", "-m", &reflog, "HEAD", &object_id, &old_id])?;
+    if args.update_ref {
+        let old_id =
+            parent.unwrap_or_else(|| "0000000000000000000000000000000000000000".to_owned());
+        git_output(&["update-ref", "-m", &reflog, "HEAD", &object_id, &old_id])?;
+    }
     eprintln!("Found in {:.2?}", started.elapsed());
-    println!("[{object_id}] {subject}");
+    if args.update_ref {
+        println!("[{object_id}] {subject}");
+    } else {
+        println!("{object_id}");
+    }
     Ok(())
 }
 

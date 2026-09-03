@@ -44,6 +44,15 @@ about twice as fast as the default custom header:
 git-sha1-cuda commit --carrier trailer --prefix 0000000 -m "Implement the parser"
 ```
 
+Read a message from a file or standard input with `-F`. Use
+`--no-update-ref` to write and print the commit object without advancing
+`HEAD`, which is useful when another tool manages refs:
+
+```bash
+git-sha1-cuda commit --prefix 0000000 -F message.txt --no-update-ref
+printf 'Automated commit\n' | git-sha1-cuda commit --prefix 0000000 -F -
+```
+
 The command uses:
 
 - the tree represented by the current Git index;
