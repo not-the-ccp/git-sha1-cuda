@@ -1,6 +1,6 @@
 [package]
 name = "git-sha1-cuda"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 links = "git_sha1_cuda"

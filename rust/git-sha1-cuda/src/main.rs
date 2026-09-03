@@ -106,7 +106,10 @@ impl PreparedJob {
 }
 
 fn usage() -> &'static str {
-    r#"git-sha1-cuda 0.1.0
+    concat!(
+        "git-sha1-cuda ",
+        env!("CARGO_PKG_VERSION"),
+        r#"
 Create an unsigned Git commit whose SHA-1 begins with a chosen prefix.
 
 USAGE:
@@ -124,6 +127,7 @@ OPTIONS:
     -h, --help           Print help
     -V, --version        Print version
 "#
+    )
 }
 
 fn parse_args() -> Result<CommitArgs, String> {
@@ -135,7 +139,7 @@ fn parse_args() -> Result<CommitArgs, String> {
             std::process::exit(0);
         }
         Some(flag) if flag == "-V" || flag == "--version" => {
-            println!("git-sha1-cuda 0.1.0");
+            println!("git-sha1-cuda {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         }
         Some(command) => return Err(format!("unknown command: {}", command.to_string_lossy())),
@@ -179,7 +183,7 @@ fn parse_args() -> Result<CommitArgs, String> {
                 std::process::exit(0);
             }
             Some("-V" | "--version") => {
-                println!("git-sha1-cuda 0.1.0");
+                println!("git-sha1-cuda {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown option: {}", arg.to_string_lossy())),
