@@ -22,6 +22,7 @@ struct CommitArgs {
     device: i32,
     carrier: CommitCarrier,
     update_ref: bool,
+    allow_empty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +118,7 @@ OPTIONS:
         --carrier TYPE   Nonce location: header or trailer [default: header]
         --device N       CUDA device index [default: 0]
         --no-update-ref  Write the commit object without advancing HEAD
+        --allow-empty    Create a commit when the index tree is unchanged
     -h, --help           Print help
     -V, --version        Print version
 "#
@@ -144,6 +146,7 @@ fn parse_args() -> Result<CommitArgs, String> {
     let mut device = 0;
     let mut carrier = CommitCarrier::Header;
     let mut update_ref = true;
+    let mut allow_empty = false;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-p" | "--prefix") => {
@@ -166,6 +169,7 @@ fn parse_args() -> Result<CommitArgs, String> {
                 };
             }
             Some("--no-update-ref") => update_ref = false,
+            Some("--allow-empty") => allow_empty = true,
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 std::process::exit(0);
@@ -195,6 +199,7 @@ fn parse_args() -> Result<CommitArgs, String> {
         device,
         carrier,
         update_ref,
+        allow_empty,
     })
 }
 
@@ -267,7 +272,10 @@ fn git_input(arguments: &[&str], input: &[u8]) -> Result<String, Box<dyn Error>>
     Ok(String::from_utf8(output.stdout)?.trim_end().to_owned())
 }
 
-fn commit_payload(message: &[u8]) -> Result<(Vec<u8>, Option<String>), Box<dyn Error>> {
+fn commit_payload(
+    message: &[u8],
+    allow_empty: bool,
+) -> Result<(Vec<u8>, Option<String>), Box<dyn Error>> {
     git_output(&["rev-parse", "--git-dir"])?;
     let format = git_output(&["rev-parse", "--show-object-format"])?;
     if format != "sha1" {
@@ -276,10 +284,12 @@ fn commit_payload(message: &[u8]) -> Result<(Vec<u8>, Option<String>), Box<dyn E
 
     let tree = git_output(&["write-tree"])?;
     let parent = git_optional(&["rev-parse", "--verify", "HEAD"])?;
-    if let Some(parent_id) = &parent {
-        let parent_tree = git_output(&["show", "-s", "--format=%T", parent_id])?;
-        if parent_tree == tree {
-            return Err("the index has no changes to commit".into());
+    if !allow_empty {
+        if let Some(parent_id) = &parent {
+            let parent_tree = git_output(&["show", "-s", "--format=%T", parent_id])?;
+            if parent_tree == tree {
+                return Err("the index has no changes to commit".into());
+            }
         }
     }
     let author = git_output(&["var", "GIT_AUTHOR_IDENT"])?;
@@ -328,7 +338,7 @@ fn prepare_job(
 fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args().map_err(|message| format!("{message}\n\n{}", usage()))?;
     let message = read_message(&args)?;
-    let (payload, parent) = commit_payload(&message)?;
+    let (payload, parent) = commit_payload(&message, args.allow_empty)?;
     let target = TargetPrefix::from_hex(&args.prefix)?;
     let mut epoch = 0_u64;
     let mut job = prepare_job(&payload, target, args.carrier, epoch)?;

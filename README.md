@@ -53,6 +53,8 @@ git-sha1-cuda commit --prefix 0000000 -F message.txt --no-update-ref
 printf 'Automated commit\n' | git-sha1-cuda commit --prefix 0000000 -F -
 ```
 
+`--allow-empty` permits a commit when the index has the same tree as `HEAD`.
+
 The command uses:
 
 - the tree represented by the current Git index;
