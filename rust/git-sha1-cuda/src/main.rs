@@ -37,21 +37,96 @@ struct CommitArgs {
     author_date: Option<String>,
     reset_author: bool,
     start_epoch: u64,
+    resume: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommitCarrier {
     Header,
     Trailer,
 }
 
 impl CommitCarrier {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::Trailer => "trailer",
+        }
+    }
+
     fn eligible_fraction(self) -> f64 {
         match self {
             Self::Header => 1.0,
             Self::Trailer => (255.0_f64 / 256.0).powi(5),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResumePoint {
+    carrier: CommitCarrier,
+    prefix: String,
+    epoch: u64,
+    offset: u64,
+    author_date: String,
+    committer_date: String,
+    payload_id: String,
+}
+
+fn normalized_prefix(prefix: &str) -> String {
+    prefix
+        .strip_prefix("0x")
+        .unwrap_or(prefix)
+        .to_ascii_lowercase()
+}
+
+fn valid_timezone(text: &str) -> bool {
+    text.len() == 5
+        && matches!(text.as_bytes()[0], b'+' | b'-')
+        && text.as_bytes()[1..].iter().all(u8::is_ascii_digit)
+}
+
+fn parse_resume_token(text: &str) -> Result<ResumePoint, String> {
+    let fields: Vec<_> = text.split(':').collect();
+    if fields.len() != 10 || fields[0] != "gsv1" {
+        return Err("invalid resume token".to_owned());
+    }
+    let carrier = match fields[1] {
+        "header" => CommitCarrier::Header,
+        "trailer" => CommitCarrier::Trailer,
+        _ => return Err("resume token has an unknown carrier".to_owned()),
+    };
+    let prefix = normalized_prefix(fields[2]);
+    if prefix.is_empty()
+        || prefix.len() > 12
+        || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("resume token has an invalid prefix".to_owned());
+    }
+    let epoch = fields[3]
+        .parse()
+        .map_err(|_| "resume token has an invalid epoch".to_owned())?;
+    let offset = fields[4]
+        .parse()
+        .map_err(|_| "resume token has an invalid offset".to_owned())?;
+    if fields[5].parse::<i64>().is_err() || !valid_timezone(fields[6]) {
+        return Err("resume token has an invalid author date".to_owned());
+    }
+    if fields[7].parse::<i64>().is_err() || !valid_timezone(fields[8]) {
+        return Err("resume token has an invalid committer date".to_owned());
+    }
+    if fields[9].len() != 40 || !fields[9].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("resume token has an invalid payload fingerprint".to_owned());
+    }
+    Ok(ResumePoint {
+        carrier,
+        prefix,
+        epoch,
+        offset,
+        author_date: format!("{} {}", fields[5], fields[6]),
+        committer_date: format!("{} {}", fields[7], fields[8]),
+        payload_id: fields[9].to_ascii_lowercase(),
+    })
 }
 
 enum PreparedJob {
@@ -162,6 +237,7 @@ OPTIONS:
         --date DATE      Set the author date using a Git date expression
         --reset-author   Reset author identity and date when amending
         --start-epoch N  Begin with nonce epoch N [default: 0]
+        --resume TOKEN   Resume from a token printed by an earlier search
     -h, --help           Print help
     -V, --version        Print version
 "#
@@ -231,6 +307,8 @@ fn parse_args() -> Result<CommitArgs, String> {
     let mut author_date = None;
     let mut reset_author = false;
     let mut start_epoch = 0;
+    let mut start_epoch_set = false;
+    let mut resume = None;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-p" | "--prefix") => {
@@ -262,7 +340,9 @@ fn parse_args() -> Result<CommitArgs, String> {
                 start_epoch = value(&mut args, "--start-epoch")?
                     .parse()
                     .map_err(|_| "--start-epoch must be an unsigned integer".to_owned())?;
+                start_epoch_set = true;
             }
+            Some("--resume") => resume = Some(value(&mut args, "--resume")?),
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 std::process::exit(0);
@@ -291,6 +371,9 @@ fn parse_args() -> Result<CommitArgs, String> {
     if reset_author && (author.is_some() || author_date.is_some()) {
         return Err("--reset-author cannot be combined with --author or --date".to_owned());
     }
+    if resume.is_some() && start_epoch_set {
+        return Err("--resume cannot be combined with --start-epoch".to_owned());
+    }
     Ok(CommitArgs {
         prefix,
         messages,
@@ -304,6 +387,7 @@ fn parse_args() -> Result<CommitArgs, String> {
         author_date,
         reset_author,
         start_epoch,
+        resume,
     })
 }
 
@@ -399,6 +483,12 @@ fn current_author_ident(
     Ok(output.strip_suffix(b"\n").unwrap_or(&output).to_vec())
 }
 
+fn current_committer_ident(date: Option<&str>) -> Result<Vec<u8>, Box<dyn Error>> {
+    let variables = date.map_or_else(Vec::new, |date| vec![("GIT_COMMITTER_DATE", date)]);
+    let output = git_bytes_with_env(&["var", "GIT_COMMITTER_IDENT"], &variables)?;
+    Ok(output.strip_suffix(b"\n").unwrap_or(&output).to_vec())
+}
+
 fn ident_parts(ident: &[u8]) -> Result<IdentParts<'_>, Box<dyn Error>> {
     let close = ident
         .iter()
@@ -417,7 +507,7 @@ fn amended_author_ident(
     reset: bool,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     if reset {
-        return current_author_ident(None, None);
+        return current_author_ident(None, date);
     }
     if author.is_none() && date.is_none() {
         return Ok(original.to_vec());
@@ -434,6 +524,45 @@ fn amended_author_ident(
     result.push(b' ');
     result.extend_from_slice(if date.is_some() { new_date } else { old_date });
     Ok(result)
+}
+
+fn payload_ident_date(payload: &[u8], header: &[u8]) -> Result<String, Box<dyn Error>> {
+    let header_end = payload
+        .windows(2)
+        .position(|bytes| bytes == b"\n\n")
+        .ok_or("commit payload has no header separator")?;
+    let value = payload[..header_end]
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(header))
+        .ok_or("commit payload is missing an identity header")?;
+    let (_, date) = ident_parts(value)?;
+    Ok(String::from_utf8(date.to_vec())?)
+}
+
+fn resume_token(
+    carrier: CommitCarrier,
+    prefix: &str,
+    epoch: u64,
+    offset: u64,
+    payload: &[u8],
+    payload_id: &str,
+) -> Result<String, Box<dyn Error>> {
+    let author_date = payload_ident_date(payload, b"author ")?;
+    let committer_date = payload_ident_date(payload, b"committer ")?;
+    let (author_timestamp, author_timezone) = author_date
+        .split_once(' ')
+        .ok_or("author date has no timezone")?;
+    let (committer_timestamp, committer_timezone) = committer_date
+        .split_once(' ')
+        .ok_or("committer date has no timezone")?;
+    Ok(format!(
+        "gsv1:{}:{}:{epoch}:{offset}:{author_timestamp}:{author_timezone}:{}:{}:{}",
+        carrier.name(),
+        normalized_prefix(prefix),
+        committer_timestamp,
+        committer_timezone,
+        payload_id
+    ))
 }
 
 fn git_output(arguments: &[&str]) -> Result<String, Box<dyn Error>> {
@@ -476,6 +605,7 @@ fn commit_payload(
     author_override: Option<&str>,
     author_date: Option<&str>,
     reset_author: bool,
+    committer_date: Option<&str>,
 ) -> Result<(Vec<u8>, Option<String>), Box<dyn Error>> {
     git_output(&["rev-parse", "--git-dir"])?;
     let format = git_output(&["rev-parse", "--show-object-format"])?;
@@ -523,7 +653,7 @@ fn commit_payload(
                 .collect(),
         )
     };
-    let committer = git_output(&["var", "GIT_COMMITTER_IDENT"])?;
+    let committer = current_committer_ident(committer_date)?;
     let mut payload = format!("tree {tree}\n").into_bytes();
     for parent_id in parents {
         payload.extend_from_slice(b"parent ");
@@ -532,7 +662,9 @@ fn commit_payload(
     }
     payload.extend_from_slice(b"author ");
     payload.extend_from_slice(&author);
-    payload.extend_from_slice(format!("\ncommitter {committer}\n\n").as_bytes());
+    payload.extend_from_slice(b"\ncommitter ");
+    payload.extend_from_slice(&committer);
+    payload.extend_from_slice(b"\n\n");
     payload.extend_from_slice(message);
     if !payload.ends_with(b"\n") {
         payload.push(b'\n');
@@ -691,18 +823,55 @@ fn run() -> Result<(), Box<dyn Error>> {
         _ => {}
     }
     let args = parse_args().map_err(|message| format!("{message}\n\n{}", usage()))?;
+    let resume = args.resume.as_deref().map(parse_resume_token).transpose()?;
+    if let Some(point) = &resume {
+        if point.carrier != args.carrier {
+            return Err(format!(
+                "resume token uses the {} carrier; select it with --carrier {}",
+                point.carrier.name(),
+                point.carrier.name()
+            )
+            .into());
+        }
+        if point.prefix != normalized_prefix(&args.prefix) {
+            return Err("resume token prefix does not match --prefix".into());
+        }
+    }
     let message = read_message(&args)?;
+    let author_date = resume
+        .as_ref()
+        .map_or(args.author_date.as_deref(), |point| {
+            Some(point.author_date.as_str())
+        });
+    let committer_date = resume.as_ref().map(|point| point.committer_date.as_str());
     let (payload, parent) = commit_payload(
         &message,
         args.allow_empty,
         args.amend,
         args.author.as_deref(),
-        args.author_date.as_deref(),
+        author_date,
         args.reset_author,
+        committer_date,
     )?;
+    let payload_id = git_input(&["hash-object", "-t", "commit", "--stdin"], &payload)?;
+    if resume
+        .as_ref()
+        .is_some_and(|point| point.payload_id != payload_id)
+    {
+        return Err(
+            "resume token does not match the prepared commit; repository state or commit options changed"
+                .into(),
+        );
+    }
     let target = TargetPrefix::from_hex(&args.prefix)?;
-    let mut epoch = args.start_epoch;
+    let mut epoch = resume
+        .as_ref()
+        .map_or(args.start_epoch, |point| point.epoch);
     let mut job = prepare_job(&payload, target, args.carrier, epoch)?;
+    let mut search_base = resume.as_ref().map_or(0, |point| point.offset);
+    if search_base >= job.domain_size() {
+        return Err("resume token offset is outside the carrier domain".into());
+    }
     let mut context = job.create_context(args.device)?;
 
     eprintln!(
@@ -711,9 +880,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
     let started = Instant::now();
     let mut last_progress = started;
-    let mut search_base = 0;
     let mut total_hashed = 0_u64;
     let expected_hashes = 2.0_f64.powi(target.bits() as i32) / args.carrier.eligible_fraction();
+    let prior_hashed = resume.as_ref().map_or(0.0, |point| {
+        point.epoch as f64 * PRINTABLE_DOMAIN as f64
+            + point.offset as f64
+                * match args.carrier {
+                    CommitCarrier::Header => 1.0,
+                    CommitCarrier::Trailer => 256.0,
+                }
+    });
     let batch_size = job.batch_size(target.bits());
     let candidate = loop {
         let search_count =
@@ -732,11 +908,23 @@ fn run() -> Result<(), Box<dyn Error>> {
             eprintln!("  continuing with nonce epoch {epoch}");
         }
         if last_progress.elapsed() >= Duration::from_secs(1) {
-            let match_probability = -(-(total_hashed as f64) / expected_hashes).exp_m1();
+            let match_probability =
+                -(-((prior_hashed + total_hashed as f64) / expected_hashes)).exp_m1();
             eprintln!(
                 "  {:.1}% match probability ({:.2} GH/s, epoch {epoch})",
                 match_probability * 100.0,
                 total_hashed as f64 / started.elapsed().as_secs_f64() / 1e9
+            );
+            eprintln!(
+                "  resume token: {}",
+                resume_token(
+                    args.carrier,
+                    &args.prefix,
+                    epoch,
+                    search_base,
+                    &payload,
+                    &payload_id
+                )?
             );
             last_progress = Instant::now();
         }
@@ -791,7 +979,8 @@ fn main() {
 mod tests {
     use super::{
         amended_author_ident, candidate_batch_size, ident_parts, parse_author_identity,
-        raw_outer_base, RAW_OUTER_DOMAIN, RAW_OUTER_START,
+        parse_resume_token, raw_outer_base, resume_token, CommitCarrier, RAW_OUTER_DOMAIN,
+        RAW_OUTER_START,
     };
 
     #[test]
@@ -809,6 +998,39 @@ mod tests {
         assert_eq!(raw_outer_base(0), RAW_OUTER_START);
         assert_eq!(raw_outer_base(RAW_OUTER_DOMAIN - RAW_OUTER_START), 0);
         assert_eq!(raw_outer_base(RAW_OUTER_DOMAIN - 1), RAW_OUTER_START - 1);
+    }
+
+    #[test]
+    fn resume_tokens_round_trip_search_and_payload_state() {
+        let payload = b"tree 0000000000000000000000000000000000000000\n\
+author Ada <ada@example.com> 1234567890 +0130\n\
+committer Grace <grace@example.com> 1234567891 -0700\n\nmessage\n";
+        let token = resume_token(
+            CommitCarrier::Trailer,
+            "0xAbCd",
+            7,
+            12345,
+            payload,
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .unwrap();
+        let point = parse_resume_token(&token).unwrap();
+        assert_eq!(point.carrier, CommitCarrier::Trailer);
+        assert_eq!(point.prefix, "abcd");
+        assert_eq!(point.epoch, 7);
+        assert_eq!(point.offset, 12345);
+        assert_eq!(point.author_date, "1234567890 +0130");
+        assert_eq!(point.committer_date, "1234567891 -0700");
+        assert_eq!(point.payload_id, "0123456789abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn resume_tokens_reject_malformed_state() {
+        assert!(parse_resume_token("gsv1:header:0000000:0:1").is_err());
+        assert!(parse_resume_token(
+            "gsv1:unknown:0000000:0:1:1:+0000:1:+0000:0123456789abcdef0123456789abcdef01234567"
+        )
+        .is_err());
     }
 
     #[test]

@@ -106,9 +106,26 @@ index is rejected after the first commit.
 
 The CLI automatically starts a fresh nonce epoch when a complete 40-bit domain
 contains no eligible match. Progress reports show the probability that a match
-would have appeared after the work completed so far.
+would have appeared after the work completed so far. Each progress report also
+contains a resume token for the next unsearched batch:
 
-Use `--start-epoch N` to resume at a later completed epoch. An epoch covers one
+```text
+resume token: gsv1:header:0123456789ab:0:10737418240:...
+```
+
+Restart the same command with the latest token:
+
+```bash
+git-sha1-cuda commit --prefix 0123456789ab -m "Long search" \
+  --resume 'PASTE_TOKEN_HERE'
+```
+
+The token restores the exact author and committer times. A fingerprint binds it
+to the prepared commit, so changes to the index, parent, message, identities, or
+object-forming options are detected before CUDA work begins. Trailer searches
+retain `--carrier trailer` when resumed.
+
+Use `--start-epoch N` to begin at a later epoch. An epoch covers one
 40-bit candidate domain and takes about 3 minutes 38 seconds with the default
 header carrier on the measured RTX 4060.
 
