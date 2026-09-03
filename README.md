@@ -69,6 +69,10 @@ Version 0.1 supports SHA-1 repositories, one-parent commits, `-m` messages, and
 the current index. Git commit hooks are outside this workflow. An unchanged
 index is rejected after the first commit.
 
+The CLI automatically starts a fresh nonce epoch when a complete 40-bit domain
+contains no eligible match. Progress reports show the probability that a match
+would have appeared after the work completed so far.
+
 ## Search time
 
 Measurements on a GeForce RTX 4060 with CUDA 13.3 reached approximately

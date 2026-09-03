@@ -235,6 +235,15 @@ impl GitJob {
         Self::message_trailer_labeled(payload, target, b"X: ")
     }
 
+    pub fn message_trailer_epoch(
+        payload: &[u8],
+        target: TargetPrefix,
+        epoch: u64,
+    ) -> Result<Self, PreparationError> {
+        let label = format!("X: {epoch:016x} ");
+        Self::message_trailer_labeled(payload, target, label.as_bytes())
+    }
+
     pub fn message_trailer_labeled(
         payload: &[u8],
         target: TargetPrefix,
@@ -535,6 +544,16 @@ visible subject\n";
             first.digest(0x6162_6364_65).unwrap(),
             second.digest(0x6162_6364_65).unwrap()
         );
+    }
+
+    #[test]
+    fn trailer_epochs_produce_distinct_aligned_domains() {
+        let target = TargetPrefix::from_hex("0123456789").unwrap();
+        let first = GitJob::message_trailer_epoch(COMMIT, target, 0).unwrap();
+        let second = GitJob::message_trailer_epoch(COMMIT, target, 1).unwrap();
+        assert_eq!(first.nonce_object_offset() % 64, 48);
+        assert_eq!(second.nonce_object_offset() % 64, 48);
+        assert_ne!(first.object_template(), second.object_template());
     }
 
     #[test]

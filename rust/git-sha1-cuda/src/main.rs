@@ -28,6 +28,15 @@ enum CommitCarrier {
     Trailer,
 }
 
+impl CommitCarrier {
+    fn eligible_fraction(self) -> f64 {
+        match self {
+            Self::Header => (254.0_f64 / 256.0).powi(5),
+            Self::Trailer => (255.0_f64 / 256.0).powi(5),
+        }
+    }
+}
+
 fn usage() -> &'static str {
     r#"git-sha1-cuda 0.1.0
 Create an unsigned Git commit whose SHA-1 begins with a chosen prefix.
@@ -230,15 +239,27 @@ fn hex_digest(digest: &[u8; 20]) -> String {
     text
 }
 
+fn prepare_job(
+    payload: &[u8],
+    target: TargetPrefix,
+    carrier: CommitCarrier,
+    epoch: u64,
+) -> Result<GitJob, Box<dyn Error>> {
+    Ok(match (carrier, epoch) {
+        (CommitCarrier::Header, 0) => GitJob::header(payload, target)?,
+        (CommitCarrier::Header, epoch) => GitJob::header_epoch(payload, target, epoch)?,
+        (CommitCarrier::Trailer, 0) => GitJob::message_trailer(payload, target)?,
+        (CommitCarrier::Trailer, epoch) => GitJob::message_trailer_epoch(payload, target, epoch)?,
+    })
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args().map_err(|message| format!("{message}\n\n{}", usage()))?;
     let message = read_message(&args)?;
     let (payload, parent) = commit_payload(&message)?;
     let target = TargetPrefix::from_hex(&args.prefix)?;
-    let job = match args.carrier {
-        CommitCarrier::Header => GitJob::header(&payload, target)?,
-        CommitCarrier::Trailer => GitJob::message_trailer(&payload, target)?,
-    };
+    let mut epoch = 0_u64;
+    let mut job = prepare_job(&payload, target, args.carrier, epoch)?;
     let mut context = job.create_context(args.device)?;
 
     eprintln!(
@@ -248,22 +269,35 @@ fn run() -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let mut last_progress = started;
     let mut outer_base = 0;
+    let mut total_hashed = 0_u64;
+    let expected_hashes = 2.0_f64.powi(target.bits() as i32) / args.carrier.eligible_fraction();
     let candidate = loop {
         let outer_count = DEFAULT_OUTER_BATCH.min(OUTER_DOMAIN - outer_base);
         let result = context.search(outer_base, outer_count)?;
         if let Some(candidate) = result.candidate {
             break candidate;
         }
+        total_hashed = total_hashed.saturating_add(result.candidates_hashed);
         outer_base += outer_count;
         if outer_base == OUTER_DOMAIN {
-            return Err("the complete 40-bit candidate space contained no match".into());
+            epoch = epoch.checked_add(1).ok_or("nonce epoch overflow")?;
+            job = prepare_job(&payload, target, args.carrier, epoch)?;
+            job.configure_context_with_policy(
+                &mut context,
+                match args.carrier {
+                    CommitCarrier::Header => git_sha1_cuda::NoncePolicy::HeaderSafe,
+                    CommitCarrier::Trailer => git_sha1_cuda::NoncePolicy::NoNul,
+                },
+            )?;
+            outer_base = 0;
+            eprintln!("  continuing with nonce epoch {epoch}");
         }
         if last_progress.elapsed() >= Duration::from_secs(1) {
-            let candidates = outer_base.saturating_mul(256);
+            let match_probability = -(-(total_hashed as f64) / expected_hashes).exp_m1();
             eprintln!(
-                "  {:.1}% searched ({:.2} GH/s)",
-                outer_base as f64 * 100.0 / OUTER_DOMAIN as f64,
-                candidates as f64 / started.elapsed().as_secs_f64() / 1e9
+                "  {:.1}% match probability ({:.2} GH/s, epoch {epoch})",
+                match_probability * 100.0,
+                total_hashed as f64 / started.elapsed().as_secs_f64() / 1e9
             );
             last_progress = Instant::now();
         }
