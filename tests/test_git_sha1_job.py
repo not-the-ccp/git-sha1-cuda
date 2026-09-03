@@ -11,15 +11,18 @@ import unittest
 from tools.git_sha1_job import (
     MASK32,
     RAW_NONCE_BLOCK_OFFSET,
+    MASKED_NONCE_BLOCK_OFFSET,
     TargetPrefix,
     block_words,
     build_header_job,
+    build_masked_header_job,
     build_raw_tail_job,
     candidate_nonce,
     candidate_words,
     h0_gate_parameters,
     nonce_is_header_safe,
     nonce_is_log_safe,
+    masked_candidate_nonce,
     render_cuda_header,
     serialize_git_commit,
     sha1_compress,
@@ -301,6 +304,31 @@ class HeaderJobTests(unittest.TestCase):
         self.assertEqual(second.nonce_object_offset % 64, RAW_NONCE_BLOCK_OFFSET)
         self.assertNotEqual(first.object_template, second.object_template)
         self.assertNotEqual(first.digest(candidate), second.digest(candidate))
+
+
+class MaskedHeaderJobTests(unittest.TestCase):
+    def test_candidate_mapping_is_printable_and_bijective(self) -> None:
+        candidates = (0, 1, 0x1234_5678_9A, (1 << 40) - 1)
+        encoded = [masked_candidate_nonce(candidate) for candidate in candidates]
+        self.assertEqual(encoded[0], b" " * 8)
+        self.assertEqual(encoded[-1], b"?" * 8)
+        self.assertEqual(len(set(encoded)), len(candidates))
+        for nonce in encoded:
+            self.assertTrue(all(0x20 <= byte <= 0x3F for byte in nonce))
+
+    def test_layout_and_digest_across_message_lengths(self) -> None:
+        rng = random.Random(0x384D_4153)
+        for size in (0, 1, 31, 32, 63, 64, 255, 1024):
+            message = rng.randbytes(size)
+            source = b"tree deadbeef\nauthor A <a@localhost> 0 +0000\ncommitter A <a@localhost> 0 +0000\n\n" + message
+            job = build_masked_header_job(source, TargetPrefix.from_hex("12345678"))
+            candidate = 0x1234_5678_9A
+            with self.subTest(size=size):
+                self.assertEqual(job.nonce_object_offset % 64, MASKED_NONCE_BLOCK_OFFSET)
+                self.assertEqual(job.mutable_block_template[44:52], b"\0" * 8)
+                self.assertEqual(job.base_words[11:13], (0, 0))
+                self.assertEqual(job.digest_from_prestate(candidate), job.digest(candidate))
+                self.assertIn(masked_candidate_nonce(candidate), job.materialize_payload(candidate))
 
 
 if __name__ == "__main__":

@@ -38,6 +38,25 @@ static constexpr uint32_t HEADER_UNSAFE_OUTER_EXPECTED[5] = {
     0x76eb321eu, 0xaa7ee1ccu, 0x24189162u, 0x4c76fa34u, 0x0ad2b9c2u};
 static constexpr uint32_t HEADER_CONTROL_EXPECTED[5] = {
     0xea1f27afu, 0x59f8313cu, 0x6e5aafcfu, 0x969ebc02u, 0x455985e6u};
+static constexpr uint32_t HEADER_MASK_EXPECTED[5] = {
+    0x72802ed0u, 0x53d271b8u, 0x5201c99bu, 0x9a870e01u, 0xac9bf44au};
+static constexpr uint64_t HEADER_MASK_CANDIDATE = 0x2122232425ull;
+
+static constexpr uint32_t MASKED_PRESTATE[5] = {
+    0xfdfd5e6eu, 0x56cc1fb8u, 0xdb4166b9u, 0xce7f4387u, 0xbd802c29u};
+static constexpr uint32_t MASKED_BASE_WORDS[16] = {
+    0x2b303030u, 0x300a7820u, 0x20202020u, 0x20202020u,
+    0x20202020u, 0x20202020u, 0x20202020u, 0x20202020u,
+    0x20202020u, 0x20202020u, 0x20202020u, 0x00000000u,
+    0x00000000u, 0x0a0a7669u, 0x7369626cu, 0x65207375u};
+static constexpr uint32_t MASKED_SUFFIX_WORDS[16] = {
+    0x626a6563u, 0x740a8000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000630u};
+static constexpr uint32_t MASKED_EXPECTED[5] = {
+    0x894dbe83u, 0xf20d4815u, 0xfde83abbu, 0x8582b2ccu, 0x7b4b696cu};
+static constexpr uint64_t MASKED_CANDIDATE = 0x123456789aull;
 
 static int fail(const char *what, gsv_status status, const gsv_context *context = nullptr) {
   std::fprintf(stderr, "%s: %s: %s\n", what, gsv_status_string(status), gsv_last_error(context));
@@ -107,6 +126,24 @@ int main(int argc, char **argv) {
   status = gsv_search(context, HEADER_CANDIDATE >> 8, 1, &result);
   if (status != GSV_FOUND || result.candidate != HEADER_CANDIDATE) {
     int rc = fail("header exact search", status, context);
+    gsv_context_destroy(context);
+    return rc;
+  }
+  status = gsv_search_printable(context, 56331458u, 1, &result);
+  if (status != GSV_FOUND || result.candidate != HEADER_CANDIDATE ||
+      result.candidates_hashed != 95) {
+    int rc = fail("base-95 printable search", status, context);
+    gsv_context_destroy(context);
+    return rc;
+  }
+  status = gsv_job_init(&job, HEADER_PRESTATE, HEADER_BASE_WORDS, 160, HEADER_MASK_EXPECTED);
+  if (status != GSV_OK) { int rc = fail("mask job init", status); gsv_context_destroy(context); return rc; }
+  status = gsv_context_set_header_job(context, &job, HEADER_SUFFIX_WORDS, 1);
+  if (status != GSV_OK) { int rc = fail("set mask job", status, context); gsv_context_destroy(context); return rc; }
+  status = gsv_search_printable_mask(context, 34916u, 1, &result);
+  if (status != GSV_FOUND || result.candidate != HEADER_MASK_CANDIDATE ||
+      result.candidates_hashed != 32) {
+    int rc = fail("masked printable search", status, context);
     gsv_context_destroy(context);
     return rc;
   }
@@ -190,6 +227,24 @@ int main(int argc, char **argv) {
     gsv_context_destroy(context);
     return rc;
   }
+
+  status = gsv_context_set_masked_header_job(
+      context, MASKED_PRESTATE, MASKED_BASE_WORDS, 160, MASKED_EXPECTED,
+      MASKED_SUFFIX_WORDS, 1);
+  if (status != GSV_OK) { int rc = fail("set masked-header job", status, context); gsv_context_destroy(context); return rc; }
+  status = gsv_digest_masked_header(context, MASKED_CANDIDATE, digest);
+  if (status != GSV_OK || std::memcmp(digest, MASKED_EXPECTED, sizeof(digest)) != 0) {
+    int rc = fail("masked-header digest", status, context);
+    gsv_context_destroy(context);
+    return rc;
+  }
+  status = gsv_search_masked_header(context, MASKED_CANDIDATE, 1, &result);
+  if (status != GSV_FOUND || result.candidate != MASKED_CANDIDATE ||
+      result.candidates_hashed != 1) {
+    int rc = fail("masked-header exact search", status, context);
+    gsv_context_destroy(context);
+    return rc;
+  }
   std::printf("candidate=%010llx digest=%08x%08x%08x%08x%08x ghs=%.3f\n",
               static_cast<unsigned long long>(result.candidate), digest[0], digest[1], digest[2],
               digest[3], digest[4], result.billions_per_second);
@@ -200,22 +255,40 @@ int main(int argc, char **argv) {
     const bool benchmark_header = argc > 4 && std::strcmp(argv[4], "header") == 0;
     const uint32_t benchmark_suffix_blocks =
         benchmark_header && argc > 5 ? uint32_t(std::strtoul(argv[5], nullptr, 0)) : 1u;
+    const char *benchmark_domain = argc > 6 ? argv[6] : "raw";
+    const bool benchmark_masked = std::strcmp(benchmark_domain, "masked8") == 0;
     const uint32_t *benchmark_prestate = benchmark_header ? HEADER_PRESTATE : PRESTATE;
     const uint32_t *benchmark_words = benchmark_header ? HEADER_BASE_WORDS : BASE_WORDS;
     const uint32_t *benchmark_expected = benchmark_header ? HEADER_EXPECTED : EXPECTED;
-    status = gsv_job_init(&job, benchmark_prestate, benchmark_words, benchmark_bits, benchmark_expected);
-    if (status != GSV_OK) { int rc = fail("benchmark job init", status); gsv_context_destroy(context); return rc; }
+    if (!benchmark_masked) {
+      status = gsv_job_init(&job, benchmark_prestate, benchmark_words,
+                            benchmark_bits, benchmark_expected);
+      if (status != GSV_OK) { int rc = fail("benchmark job init", status); gsv_context_destroy(context); return rc; }
+    }
     std::vector<uint32_t> benchmark_suffix_words(size_t(benchmark_suffix_blocks) * 16u);
     for (uint32_t block = 0; block < benchmark_suffix_blocks; ++block)
       std::memcpy(benchmark_suffix_words.data() + size_t(block) * 16u,
-                  HEADER_SUFFIX_WORDS, sizeof(HEADER_SUFFIX_WORDS));
-    status = benchmark_header
-        ? gsv_context_set_header_job(context, &job, benchmark_suffix_words.data(),
-                                     benchmark_suffix_blocks)
-        : gsv_context_set_job(context, &job);
+                  benchmark_masked ? MASKED_SUFFIX_WORDS : HEADER_SUFFIX_WORDS,
+                  sizeof(HEADER_SUFFIX_WORDS));
+    if (benchmark_masked)
+      status = gsv_context_set_masked_header_job(
+          context, MASKED_PRESTATE, MASKED_BASE_WORDS, benchmark_bits, MASKED_EXPECTED,
+          benchmark_suffix_words.data(), benchmark_suffix_blocks);
+    else if (benchmark_header)
+      status = gsv_context_set_header_job(context, &job, benchmark_suffix_words.data(),
+                                          benchmark_suffix_blocks);
+    else
+      status = gsv_context_set_job(context, &job);
     if (status != GSV_OK) { int rc = fail("set benchmark job", status, context); gsv_context_destroy(context); return rc; }
     for (int repetition = 0; repetition < repetitions; ++repetition) {
-      status = gsv_search(context, 0, outer_count, &result);
+      if (benchmark_masked)
+        status = gsv_search_masked_header(context, 0, outer_count, &result);
+      else if (std::strcmp(benchmark_domain, "base95") == 0)
+        status = gsv_search_printable(context, 0, outer_count, &result);
+      else if (std::strcmp(benchmark_domain, "mask32") == 0)
+        status = gsv_search_printable_mask(context, 0, outer_count, &result);
+      else
+        status = gsv_search(context, 0, outer_count, &result);
       if (status != GSV_FOUND && status != GSV_NOT_FOUND) {
         int rc = fail("benchmark search", status, context);
         gsv_context_destroy(context);

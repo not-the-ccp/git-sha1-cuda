@@ -11,11 +11,13 @@
 #include <vector>
 
 static constexpr int G = 2, V = 8, BLOCK = 256, STRIDE = 65;
+static constexpr int MASKED_ILP = 4, MASKED_BLOCK = 512;
 static constexpr uint32_t K0 = 0x5a827999u, K1 = 0x6ed9eba1u;
 static constexpr uint32_t K2 = 0x8f1bbcdcu, K3 = 0xca62c1d6u;
 static constexpr size_t DYNAMIC_SMEM = (BLOCK / G) * STRIDE * sizeof(uint32_t);
 
 __constant__ gsv_job C_JOB;
+__constant__ uint32_t C_PRE11[5];
 
 __host__ __device__ __forceinline__ uint32_t rol32(uint32_t x, unsigned n) {
 #ifdef __CUDA_ARCH__
@@ -196,7 +198,7 @@ __device__ __forceinline__ void compress_suffix(S &h, const uint32_t *schedules,
   }
 }
 
-template<int MODE, bool DIAG, bool HEADER>
+template<int MODE, bool DIAG, bool HEADER, int DOMAIN>
 __global__ void search_kernel(uint64_t outer_base, uint64_t outer_count, const uint32_t *table,
                               const uint32_t *suffix_schedules, uint32_t suffix_blocks,
                               uint32_t nonce_policy, uint64_t *winner,
@@ -207,8 +209,25 @@ __global__ void search_kernel(uint64_t outer_base, uint64_t outer_count, const u
   const int local_group = threadIdx.x / G;
   const uint64_t gi = uint64_t(blockIdx.x) * groups + local_group;
   const uint64_t ov = outer_base + gi;
-  const bool active = gi < outer_count && ov <= 0xffffffffull;
-  const uint32_t outer = uint32_t(ov);
+  constexpr uint64_t OUTER_LIMIT = DOMAIN == 1 ? 95ull * 95ull * 95ull * 95ull
+                                   : DOMAIN == 2 ? 1ull << 20
+                                                 : 0x100000000ull;
+  const bool active = gi < outer_count && ov < OUTER_LIMIT;
+  uint32_t outer = uint32_t(ov);
+  if constexpr (DOMAIN == 1) {
+    uint32_t ordinal = uint32_t(ov);
+    outer = 0;
+    #pragma unroll
+    for (int byte = 0; byte < 4; ++byte) {
+      outer |= (ordinal % 95u + 0x20u) << (byte * 8);
+      ordinal /= 95u;
+    }
+  } else if constexpr (DOMAIN == 2) {
+    outer = 0x20202020u | ((uint32_t(ov) & 0x0000001fu) << 0) |
+            ((uint32_t(ov) & 0x000003e0u) << 3) |
+            ((uint32_t(ov) & 0x00007c00u) << 6) |
+            ((uint32_t(ov) & 0x000f8000u) << 9);
+  }
   uint32_t *sched = shared + local_group * STRIDE;
   if (active && lane == 0) {
       sched[0] = rol32((C_JOB.base_words[13]^C_JOB.base_words[8]^C_JOB.base_words[2]^C_JOB.base_words[0]), 1);
@@ -282,8 +301,10 @@ __global__ void search_kernel(uint64_t outer_base, uint64_t outer_count, const u
   S common{C_JOB.pre12[0], C_JOB.pre12[1], C_JOB.pre12[2], C_JOB.pre12[3], C_JOB.pre12[4]};
   round_ch(common, outer);
   constexpr unsigned CHUNK = G * V;
+  constexpr unsigned INNER_BEGIN = DOMAIN ? 0x20u : 0u;
+  constexpr unsigned INNER_END = DOMAIN == 1 ? 0x7fu : DOMAIN == 2 ? 0x40u : 0x100u;
   #pragma unroll 1
-  for (unsigned chunk = 0; chunk < 256; chunk += CHUNK) {
+  for (unsigned chunk = INNER_BEGIN; chunk < INNER_END; chunk += CHUNK) {
     const unsigned j = chunk + unsigned(lane) * V;
     S st[V];
     #pragma unroll
@@ -680,6 +701,7 @@ __global__ void search_kernel(uint64_t outer_base, uint64_t outer_count, const u
       for (int i = 0; i < V; ++i) {
         const uint32_t a80 = final_a(st[i], bw ^ dv.x[i]);
         const unsigned inner = j + unsigned(i);
+        if constexpr (DOMAIN == 1) { if (inner >= INNER_END) continue; }
         S digest{a80 + C_JOB.prestate[0],
                  st[i].a + C_JOB.prestate[1],
                  rol32(st[i].b, 30) + C_JOB.prestate[2],
@@ -705,6 +727,685 @@ __global__ void search_kernel(uint64_t outer_base, uint64_t outer_count, const u
   }
 }
 
+template<bool DIAG>
+__global__ __launch_bounds__(MASKED_BLOCK) void masked8_kernel(
+    uint64_t first, uint64_t count, const uint32_t *suffix_schedules,
+    uint32_t suffix_blocks, uint64_t *winner, uint64_t diag_id, uint32_t *diag) {
+  const uint64_t thread = uint64_t(blockIdx.x) * MASKED_BLOCK + threadIdx.x;
+  const uint64_t stride = uint64_t(gridDim.x) * MASKED_BLOCK;
+  const uint64_t end = first + count;
+  for (uint64_t base = first + thread; base < end; base += stride * MASKED_ILP) {
+    const uint64_t mid0=base+0ull*stride;const bool mactive0=mid0<end;
+    const uint64_t mid1=base+1ull*stride;const bool mactive1=mid1<end;
+    const uint64_t mid2=base+2ull*stride;const bool mactive2=mid2<end;
+    const uint64_t mid3=base+3ull*stride;const bool mactive3=mid3<end;
+    const uint32_t mw11_0=0x20202020u|(uint32_t((mid0>>35)&0x1full)<<24)|(uint32_t((mid0>>30)&0x1full)<<16)|(uint32_t((mid0>>25)&0x1full)<<8)|(uint32_t((mid0>>20)&0x1full)<<0);
+    const uint32_t mw12_0=0x20202020u|(uint32_t((mid0>>15)&0x1full)<<24)|(uint32_t((mid0>>10)&0x1full)<<16)|(uint32_t((mid0>>5)&0x1full)<<8)|(uint32_t((mid0>>0)&0x1full)<<0);
+    uint32_t mw0[32];
+    mw0[0]=C_JOB.base_words[0];
+    mw0[1]=C_JOB.base_words[1];
+    mw0[2]=C_JOB.base_words[2];
+    mw0[3]=C_JOB.base_words[3];
+    mw0[4]=C_JOB.base_words[4];
+    mw0[5]=C_JOB.base_words[5];
+    mw0[6]=C_JOB.base_words[6];
+    mw0[7]=C_JOB.base_words[7];
+    mw0[8]=C_JOB.base_words[8];
+    mw0[9]=C_JOB.base_words[9];
+    mw0[10]=C_JOB.base_words[10];
+    mw0[11]=mw11_0;
+    mw0[12]=mw12_0;
+    mw0[13]=C_JOB.base_words[13];
+    mw0[14]=C_JOB.base_words[14];
+    mw0[15]=C_JOB.base_words[15];
+    S ms0{C_PRE11[0],C_PRE11[1],C_PRE11[2],C_PRE11[3],C_PRE11[4]};
+    const uint32_t mw11_1=0x20202020u|(uint32_t((mid1>>35)&0x1full)<<24)|(uint32_t((mid1>>30)&0x1full)<<16)|(uint32_t((mid1>>25)&0x1full)<<8)|(uint32_t((mid1>>20)&0x1full)<<0);
+    const uint32_t mw12_1=0x20202020u|(uint32_t((mid1>>15)&0x1full)<<24)|(uint32_t((mid1>>10)&0x1full)<<16)|(uint32_t((mid1>>5)&0x1full)<<8)|(uint32_t((mid1>>0)&0x1full)<<0);
+    uint32_t mw1[32];
+    mw1[0]=C_JOB.base_words[0];
+    mw1[1]=C_JOB.base_words[1];
+    mw1[2]=C_JOB.base_words[2];
+    mw1[3]=C_JOB.base_words[3];
+    mw1[4]=C_JOB.base_words[4];
+    mw1[5]=C_JOB.base_words[5];
+    mw1[6]=C_JOB.base_words[6];
+    mw1[7]=C_JOB.base_words[7];
+    mw1[8]=C_JOB.base_words[8];
+    mw1[9]=C_JOB.base_words[9];
+    mw1[10]=C_JOB.base_words[10];
+    mw1[11]=mw11_1;
+    mw1[12]=mw12_1;
+    mw1[13]=C_JOB.base_words[13];
+    mw1[14]=C_JOB.base_words[14];
+    mw1[15]=C_JOB.base_words[15];
+    S ms1{C_PRE11[0],C_PRE11[1],C_PRE11[2],C_PRE11[3],C_PRE11[4]};
+    const uint32_t mw11_2=0x20202020u|(uint32_t((mid2>>35)&0x1full)<<24)|(uint32_t((mid2>>30)&0x1full)<<16)|(uint32_t((mid2>>25)&0x1full)<<8)|(uint32_t((mid2>>20)&0x1full)<<0);
+    const uint32_t mw12_2=0x20202020u|(uint32_t((mid2>>15)&0x1full)<<24)|(uint32_t((mid2>>10)&0x1full)<<16)|(uint32_t((mid2>>5)&0x1full)<<8)|(uint32_t((mid2>>0)&0x1full)<<0);
+    uint32_t mw2[32];
+    mw2[0]=C_JOB.base_words[0];
+    mw2[1]=C_JOB.base_words[1];
+    mw2[2]=C_JOB.base_words[2];
+    mw2[3]=C_JOB.base_words[3];
+    mw2[4]=C_JOB.base_words[4];
+    mw2[5]=C_JOB.base_words[5];
+    mw2[6]=C_JOB.base_words[6];
+    mw2[7]=C_JOB.base_words[7];
+    mw2[8]=C_JOB.base_words[8];
+    mw2[9]=C_JOB.base_words[9];
+    mw2[10]=C_JOB.base_words[10];
+    mw2[11]=mw11_2;
+    mw2[12]=mw12_2;
+    mw2[13]=C_JOB.base_words[13];
+    mw2[14]=C_JOB.base_words[14];
+    mw2[15]=C_JOB.base_words[15];
+    S ms2{C_PRE11[0],C_PRE11[1],C_PRE11[2],C_PRE11[3],C_PRE11[4]};
+    const uint32_t mw11_3=0x20202020u|(uint32_t((mid3>>35)&0x1full)<<24)|(uint32_t((mid3>>30)&0x1full)<<16)|(uint32_t((mid3>>25)&0x1full)<<8)|(uint32_t((mid3>>20)&0x1full)<<0);
+    const uint32_t mw12_3=0x20202020u|(uint32_t((mid3>>15)&0x1full)<<24)|(uint32_t((mid3>>10)&0x1full)<<16)|(uint32_t((mid3>>5)&0x1full)<<8)|(uint32_t((mid3>>0)&0x1full)<<0);
+    uint32_t mw3[32];
+    mw3[0]=C_JOB.base_words[0];
+    mw3[1]=C_JOB.base_words[1];
+    mw3[2]=C_JOB.base_words[2];
+    mw3[3]=C_JOB.base_words[3];
+    mw3[4]=C_JOB.base_words[4];
+    mw3[5]=C_JOB.base_words[5];
+    mw3[6]=C_JOB.base_words[6];
+    mw3[7]=C_JOB.base_words[7];
+    mw3[8]=C_JOB.base_words[8];
+    mw3[9]=C_JOB.base_words[9];
+    mw3[10]=C_JOB.base_words[10];
+    mw3[11]=mw11_3;
+    mw3[12]=mw12_3;
+    mw3[13]=C_JOB.base_words[13];
+    mw3[14]=C_JOB.base_words[14];
+    mw3[15]=C_JOB.base_words[15];
+    S ms3{C_PRE11[0],C_PRE11[1],C_PRE11[2],C_PRE11[3],C_PRE11[4]};
+    round_ch(ms0,mw0[11]);
+    round_ch(ms1,mw1[11]);
+    round_ch(ms2,mw2[11]);
+    round_ch(ms3,mw3[11]);
+    round_ch(ms0,mw0[12]);
+    round_ch(ms1,mw1[12]);
+    round_ch(ms2,mw2[12]);
+    round_ch(ms3,mw3[12]);
+    round_ch(ms0,mw0[13]);
+    round_ch(ms1,mw1[13]);
+    round_ch(ms2,mw2[13]);
+    round_ch(ms3,mw3[13]);
+    round_ch(ms0,mw0[14]);
+    round_ch(ms1,mw1[14]);
+    round_ch(ms2,mw2[14]);
+    round_ch(ms3,mw3[14]);
+    round_ch(ms0,mw0[15]);
+    round_ch(ms1,mw1[15]);
+    round_ch(ms2,mw2[15]);
+    round_ch(ms3,mw3[15]);
+    mw0[16]=rol32(mw0[13]^mw0[8]^mw0[2]^mw0[0],1);
+    round_ch(ms0,mw0[16]);
+    mw1[16]=rol32(mw1[13]^mw1[8]^mw1[2]^mw1[0],1);
+    round_ch(ms1,mw1[16]);
+    mw2[16]=rol32(mw2[13]^mw2[8]^mw2[2]^mw2[0],1);
+    round_ch(ms2,mw2[16]);
+    mw3[16]=rol32(mw3[13]^mw3[8]^mw3[2]^mw3[0],1);
+    round_ch(ms3,mw3[16]);
+    mw0[17]=rol32(mw0[14]^mw0[9]^mw0[3]^mw0[1],1);
+    round_ch(ms0,mw0[17]);
+    mw1[17]=rol32(mw1[14]^mw1[9]^mw1[3]^mw1[1],1);
+    round_ch(ms1,mw1[17]);
+    mw2[17]=rol32(mw2[14]^mw2[9]^mw2[3]^mw2[1],1);
+    round_ch(ms2,mw2[17]);
+    mw3[17]=rol32(mw3[14]^mw3[9]^mw3[3]^mw3[1],1);
+    round_ch(ms3,mw3[17]);
+    mw0[18]=rol32(mw0[15]^mw0[10]^mw0[4]^mw0[2],1);
+    round_ch(ms0,mw0[18]);
+    mw1[18]=rol32(mw1[15]^mw1[10]^mw1[4]^mw1[2],1);
+    round_ch(ms1,mw1[18]);
+    mw2[18]=rol32(mw2[15]^mw2[10]^mw2[4]^mw2[2],1);
+    round_ch(ms2,mw2[18]);
+    mw3[18]=rol32(mw3[15]^mw3[10]^mw3[4]^mw3[2],1);
+    round_ch(ms3,mw3[18]);
+    mw0[19]=rol32(mw0[16]^mw0[11]^mw0[5]^mw0[3],1);
+    round_ch(ms0,mw0[19]);
+    mw1[19]=rol32(mw1[16]^mw1[11]^mw1[5]^mw1[3],1);
+    round_ch(ms1,mw1[19]);
+    mw2[19]=rol32(mw2[16]^mw2[11]^mw2[5]^mw2[3],1);
+    round_ch(ms2,mw2[19]);
+    mw3[19]=rol32(mw3[16]^mw3[11]^mw3[5]^mw3[3],1);
+    round_ch(ms3,mw3[19]);
+    mw0[20]=rol32(mw0[17]^mw0[12]^mw0[6]^mw0[4],1);
+    round_pa1(ms0,mw0[20]);
+    mw1[20]=rol32(mw1[17]^mw1[12]^mw1[6]^mw1[4],1);
+    round_pa1(ms1,mw1[20]);
+    mw2[20]=rol32(mw2[17]^mw2[12]^mw2[6]^mw2[4],1);
+    round_pa1(ms2,mw2[20]);
+    mw3[20]=rol32(mw3[17]^mw3[12]^mw3[6]^mw3[4],1);
+    round_pa1(ms3,mw3[20]);
+    mw0[21]=rol32(mw0[18]^mw0[13]^mw0[7]^mw0[5],1);
+    round_pa1(ms0,mw0[21]);
+    mw1[21]=rol32(mw1[18]^mw1[13]^mw1[7]^mw1[5],1);
+    round_pa1(ms1,mw1[21]);
+    mw2[21]=rol32(mw2[18]^mw2[13]^mw2[7]^mw2[5],1);
+    round_pa1(ms2,mw2[21]);
+    mw3[21]=rol32(mw3[18]^mw3[13]^mw3[7]^mw3[5],1);
+    round_pa1(ms3,mw3[21]);
+    mw0[22]=rol32(mw0[19]^mw0[14]^mw0[8]^mw0[6],1);
+    round_pa1(ms0,mw0[22]);
+    mw1[22]=rol32(mw1[19]^mw1[14]^mw1[8]^mw1[6],1);
+    round_pa1(ms1,mw1[22]);
+    mw2[22]=rol32(mw2[19]^mw2[14]^mw2[8]^mw2[6],1);
+    round_pa1(ms2,mw2[22]);
+    mw3[22]=rol32(mw3[19]^mw3[14]^mw3[8]^mw3[6],1);
+    round_pa1(ms3,mw3[22]);
+    mw0[23]=rol32(mw0[20]^mw0[15]^mw0[9]^mw0[7],1);
+    round_pa1(ms0,mw0[23]);
+    mw1[23]=rol32(mw1[20]^mw1[15]^mw1[9]^mw1[7],1);
+    round_pa1(ms1,mw1[23]);
+    mw2[23]=rol32(mw2[20]^mw2[15]^mw2[9]^mw2[7],1);
+    round_pa1(ms2,mw2[23]);
+    mw3[23]=rol32(mw3[20]^mw3[15]^mw3[9]^mw3[7],1);
+    round_pa1(ms3,mw3[23]);
+    mw0[24]=rol32(mw0[21]^mw0[16]^mw0[10]^mw0[8],1);
+    round_pa1(ms0,mw0[24]);
+    mw1[24]=rol32(mw1[21]^mw1[16]^mw1[10]^mw1[8],1);
+    round_pa1(ms1,mw1[24]);
+    mw2[24]=rol32(mw2[21]^mw2[16]^mw2[10]^mw2[8],1);
+    round_pa1(ms2,mw2[24]);
+    mw3[24]=rol32(mw3[21]^mw3[16]^mw3[10]^mw3[8],1);
+    round_pa1(ms3,mw3[24]);
+    mw0[25]=rol32(mw0[22]^mw0[17]^mw0[11]^mw0[9],1);
+    round_pa1(ms0,mw0[25]);
+    mw1[25]=rol32(mw1[22]^mw1[17]^mw1[11]^mw1[9],1);
+    round_pa1(ms1,mw1[25]);
+    mw2[25]=rol32(mw2[22]^mw2[17]^mw2[11]^mw2[9],1);
+    round_pa1(ms2,mw2[25]);
+    mw3[25]=rol32(mw3[22]^mw3[17]^mw3[11]^mw3[9],1);
+    round_pa1(ms3,mw3[25]);
+    mw0[26]=rol32(mw0[23]^mw0[18]^mw0[12]^mw0[10],1);
+    round_pa1(ms0,mw0[26]);
+    mw1[26]=rol32(mw1[23]^mw1[18]^mw1[12]^mw1[10],1);
+    round_pa1(ms1,mw1[26]);
+    mw2[26]=rol32(mw2[23]^mw2[18]^mw2[12]^mw2[10],1);
+    round_pa1(ms2,mw2[26]);
+    mw3[26]=rol32(mw3[23]^mw3[18]^mw3[12]^mw3[10],1);
+    round_pa1(ms3,mw3[26]);
+    mw0[27]=rol32(mw0[24]^mw0[19]^mw0[13]^mw0[11],1);
+    round_pa1(ms0,mw0[27]);
+    mw1[27]=rol32(mw1[24]^mw1[19]^mw1[13]^mw1[11],1);
+    round_pa1(ms1,mw1[27]);
+    mw2[27]=rol32(mw2[24]^mw2[19]^mw2[13]^mw2[11],1);
+    round_pa1(ms2,mw2[27]);
+    mw3[27]=rol32(mw3[24]^mw3[19]^mw3[13]^mw3[11],1);
+    round_pa1(ms3,mw3[27]);
+    mw0[28]=rol32(mw0[25]^mw0[20]^mw0[14]^mw0[12],1);
+    round_pa1(ms0,mw0[28]);
+    mw1[28]=rol32(mw1[25]^mw1[20]^mw1[14]^mw1[12],1);
+    round_pa1(ms1,mw1[28]);
+    mw2[28]=rol32(mw2[25]^mw2[20]^mw2[14]^mw2[12],1);
+    round_pa1(ms2,mw2[28]);
+    mw3[28]=rol32(mw3[25]^mw3[20]^mw3[14]^mw3[12],1);
+    round_pa1(ms3,mw3[28]);
+    mw0[29]=rol32(mw0[26]^mw0[21]^mw0[15]^mw0[13],1);
+    round_pa1(ms0,mw0[29]);
+    mw1[29]=rol32(mw1[26]^mw1[21]^mw1[15]^mw1[13],1);
+    round_pa1(ms1,mw1[29]);
+    mw2[29]=rol32(mw2[26]^mw2[21]^mw2[15]^mw2[13],1);
+    round_pa1(ms2,mw2[29]);
+    mw3[29]=rol32(mw3[26]^mw3[21]^mw3[15]^mw3[13],1);
+    round_pa1(ms3,mw3[29]);
+    mw0[30]=rol32(mw0[27]^mw0[22]^mw0[16]^mw0[14],1);
+    round_pa1(ms0,mw0[30]);
+    mw1[30]=rol32(mw1[27]^mw1[22]^mw1[16]^mw1[14],1);
+    round_pa1(ms1,mw1[30]);
+    mw2[30]=rol32(mw2[27]^mw2[22]^mw2[16]^mw2[14],1);
+    round_pa1(ms2,mw2[30]);
+    mw3[30]=rol32(mw3[27]^mw3[22]^mw3[16]^mw3[14],1);
+    round_pa1(ms3,mw3[30]);
+    mw0[31]=rol32(mw0[28]^mw0[23]^mw0[17]^mw0[15],1);
+    round_pa1(ms0,mw0[31]);
+    mw1[31]=rol32(mw1[28]^mw1[23]^mw1[17]^mw1[15],1);
+    round_pa1(ms1,mw1[31]);
+    mw2[31]=rol32(mw2[28]^mw2[23]^mw2[17]^mw2[15],1);
+    round_pa1(ms2,mw2[31]);
+    mw3[31]=rol32(mw3[28]^mw3[23]^mw3[17]^mw3[15],1);
+    round_pa1(ms3,mw3[31]);
+    mw0[0]=rol32(mw0[26]^mw0[16]^mw0[4]^mw0[0],2);
+    round_pa1(ms0,mw0[0]);
+    mw1[0]=rol32(mw1[26]^mw1[16]^mw1[4]^mw1[0],2);
+    round_pa1(ms1,mw1[0]);
+    mw2[0]=rol32(mw2[26]^mw2[16]^mw2[4]^mw2[0],2);
+    round_pa1(ms2,mw2[0]);
+    mw3[0]=rol32(mw3[26]^mw3[16]^mw3[4]^mw3[0],2);
+    round_pa1(ms3,mw3[0]);
+    mw0[1]=rol32(mw0[27]^mw0[17]^mw0[5]^mw0[1],2);
+    round_pa1(ms0,mw0[1]);
+    mw1[1]=rol32(mw1[27]^mw1[17]^mw1[5]^mw1[1],2);
+    round_pa1(ms1,mw1[1]);
+    mw2[1]=rol32(mw2[27]^mw2[17]^mw2[5]^mw2[1],2);
+    round_pa1(ms2,mw2[1]);
+    mw3[1]=rol32(mw3[27]^mw3[17]^mw3[5]^mw3[1],2);
+    round_pa1(ms3,mw3[1]);
+    mw0[2]=rol32(mw0[28]^mw0[18]^mw0[6]^mw0[2],2);
+    round_pa1(ms0,mw0[2]);
+    mw1[2]=rol32(mw1[28]^mw1[18]^mw1[6]^mw1[2],2);
+    round_pa1(ms1,mw1[2]);
+    mw2[2]=rol32(mw2[28]^mw2[18]^mw2[6]^mw2[2],2);
+    round_pa1(ms2,mw2[2]);
+    mw3[2]=rol32(mw3[28]^mw3[18]^mw3[6]^mw3[2],2);
+    round_pa1(ms3,mw3[2]);
+    mw0[3]=rol32(mw0[29]^mw0[19]^mw0[7]^mw0[3],2);
+    round_pa1(ms0,mw0[3]);
+    mw1[3]=rol32(mw1[29]^mw1[19]^mw1[7]^mw1[3],2);
+    round_pa1(ms1,mw1[3]);
+    mw2[3]=rol32(mw2[29]^mw2[19]^mw2[7]^mw2[3],2);
+    round_pa1(ms2,mw2[3]);
+    mw3[3]=rol32(mw3[29]^mw3[19]^mw3[7]^mw3[3],2);
+    round_pa1(ms3,mw3[3]);
+    mw0[4]=rol32(mw0[30]^mw0[20]^mw0[8]^mw0[4],2);
+    round_pa1(ms0,mw0[4]);
+    mw1[4]=rol32(mw1[30]^mw1[20]^mw1[8]^mw1[4],2);
+    round_pa1(ms1,mw1[4]);
+    mw2[4]=rol32(mw2[30]^mw2[20]^mw2[8]^mw2[4],2);
+    round_pa1(ms2,mw2[4]);
+    mw3[4]=rol32(mw3[30]^mw3[20]^mw3[8]^mw3[4],2);
+    round_pa1(ms3,mw3[4]);
+    mw0[5]=rol32(mw0[31]^mw0[21]^mw0[9]^mw0[5],2);
+    round_pa1(ms0,mw0[5]);
+    mw1[5]=rol32(mw1[31]^mw1[21]^mw1[9]^mw1[5],2);
+    round_pa1(ms1,mw1[5]);
+    mw2[5]=rol32(mw2[31]^mw2[21]^mw2[9]^mw2[5],2);
+    round_pa1(ms2,mw2[5]);
+    mw3[5]=rol32(mw3[31]^mw3[21]^mw3[9]^mw3[5],2);
+    round_pa1(ms3,mw3[5]);
+    mw0[6]=rol32(mw0[0]^mw0[22]^mw0[10]^mw0[6],2);
+    round_pa1(ms0,mw0[6]);
+    mw1[6]=rol32(mw1[0]^mw1[22]^mw1[10]^mw1[6],2);
+    round_pa1(ms1,mw1[6]);
+    mw2[6]=rol32(mw2[0]^mw2[22]^mw2[10]^mw2[6],2);
+    round_pa1(ms2,mw2[6]);
+    mw3[6]=rol32(mw3[0]^mw3[22]^mw3[10]^mw3[6],2);
+    round_pa1(ms3,mw3[6]);
+    mw0[7]=rol32(mw0[1]^mw0[23]^mw0[11]^mw0[7],2);
+    round_pa1(ms0,mw0[7]);
+    mw1[7]=rol32(mw1[1]^mw1[23]^mw1[11]^mw1[7],2);
+    round_pa1(ms1,mw1[7]);
+    mw2[7]=rol32(mw2[1]^mw2[23]^mw2[11]^mw2[7],2);
+    round_pa1(ms2,mw2[7]);
+    mw3[7]=rol32(mw3[1]^mw3[23]^mw3[11]^mw3[7],2);
+    round_pa1(ms3,mw3[7]);
+    mw0[8]=rol32(mw0[2]^mw0[24]^mw0[12]^mw0[8],2);
+    round_mj(ms0,mw0[8]);
+    mw1[8]=rol32(mw1[2]^mw1[24]^mw1[12]^mw1[8],2);
+    round_mj(ms1,mw1[8]);
+    mw2[8]=rol32(mw2[2]^mw2[24]^mw2[12]^mw2[8],2);
+    round_mj(ms2,mw2[8]);
+    mw3[8]=rol32(mw3[2]^mw3[24]^mw3[12]^mw3[8],2);
+    round_mj(ms3,mw3[8]);
+    mw0[9]=rol32(mw0[3]^mw0[25]^mw0[13]^mw0[9],2);
+    round_mj(ms0,mw0[9]);
+    mw1[9]=rol32(mw1[3]^mw1[25]^mw1[13]^mw1[9],2);
+    round_mj(ms1,mw1[9]);
+    mw2[9]=rol32(mw2[3]^mw2[25]^mw2[13]^mw2[9],2);
+    round_mj(ms2,mw2[9]);
+    mw3[9]=rol32(mw3[3]^mw3[25]^mw3[13]^mw3[9],2);
+    round_mj(ms3,mw3[9]);
+    mw0[10]=rol32(mw0[4]^mw0[26]^mw0[14]^mw0[10],2);
+    round_mj(ms0,mw0[10]);
+    mw1[10]=rol32(mw1[4]^mw1[26]^mw1[14]^mw1[10],2);
+    round_mj(ms1,mw1[10]);
+    mw2[10]=rol32(mw2[4]^mw2[26]^mw2[14]^mw2[10],2);
+    round_mj(ms2,mw2[10]);
+    mw3[10]=rol32(mw3[4]^mw3[26]^mw3[14]^mw3[10],2);
+    round_mj(ms3,mw3[10]);
+    mw0[11]=rol32(mw0[5]^mw0[27]^mw0[15]^mw0[11],2);
+    round_mj(ms0,mw0[11]);
+    mw1[11]=rol32(mw1[5]^mw1[27]^mw1[15]^mw1[11],2);
+    round_mj(ms1,mw1[11]);
+    mw2[11]=rol32(mw2[5]^mw2[27]^mw2[15]^mw2[11],2);
+    round_mj(ms2,mw2[11]);
+    mw3[11]=rol32(mw3[5]^mw3[27]^mw3[15]^mw3[11],2);
+    round_mj(ms3,mw3[11]);
+    mw0[12]=rol32(mw0[6]^mw0[28]^mw0[16]^mw0[12],2);
+    round_mj(ms0,mw0[12]);
+    mw1[12]=rol32(mw1[6]^mw1[28]^mw1[16]^mw1[12],2);
+    round_mj(ms1,mw1[12]);
+    mw2[12]=rol32(mw2[6]^mw2[28]^mw2[16]^mw2[12],2);
+    round_mj(ms2,mw2[12]);
+    mw3[12]=rol32(mw3[6]^mw3[28]^mw3[16]^mw3[12],2);
+    round_mj(ms3,mw3[12]);
+    mw0[13]=rol32(mw0[7]^mw0[29]^mw0[17]^mw0[13],2);
+    round_mj(ms0,mw0[13]);
+    mw1[13]=rol32(mw1[7]^mw1[29]^mw1[17]^mw1[13],2);
+    round_mj(ms1,mw1[13]);
+    mw2[13]=rol32(mw2[7]^mw2[29]^mw2[17]^mw2[13],2);
+    round_mj(ms2,mw2[13]);
+    mw3[13]=rol32(mw3[7]^mw3[29]^mw3[17]^mw3[13],2);
+    round_mj(ms3,mw3[13]);
+    mw0[14]=rol32(mw0[8]^mw0[30]^mw0[18]^mw0[14],2);
+    round_mj(ms0,mw0[14]);
+    mw1[14]=rol32(mw1[8]^mw1[30]^mw1[18]^mw1[14],2);
+    round_mj(ms1,mw1[14]);
+    mw2[14]=rol32(mw2[8]^mw2[30]^mw2[18]^mw2[14],2);
+    round_mj(ms2,mw2[14]);
+    mw3[14]=rol32(mw3[8]^mw3[30]^mw3[18]^mw3[14],2);
+    round_mj(ms3,mw3[14]);
+    mw0[15]=rol32(mw0[9]^mw0[31]^mw0[19]^mw0[15],2);
+    round_mj(ms0,mw0[15]);
+    mw1[15]=rol32(mw1[9]^mw1[31]^mw1[19]^mw1[15],2);
+    round_mj(ms1,mw1[15]);
+    mw2[15]=rol32(mw2[9]^mw2[31]^mw2[19]^mw2[15],2);
+    round_mj(ms2,mw2[15]);
+    mw3[15]=rol32(mw3[9]^mw3[31]^mw3[19]^mw3[15],2);
+    round_mj(ms3,mw3[15]);
+    mw0[16]=rol32(mw0[10]^mw0[0]^mw0[20]^mw0[16],2);
+    round_mj(ms0,mw0[16]);
+    mw1[16]=rol32(mw1[10]^mw1[0]^mw1[20]^mw1[16],2);
+    round_mj(ms1,mw1[16]);
+    mw2[16]=rol32(mw2[10]^mw2[0]^mw2[20]^mw2[16],2);
+    round_mj(ms2,mw2[16]);
+    mw3[16]=rol32(mw3[10]^mw3[0]^mw3[20]^mw3[16],2);
+    round_mj(ms3,mw3[16]);
+    mw0[17]=rol32(mw0[11]^mw0[1]^mw0[21]^mw0[17],2);
+    round_mj(ms0,mw0[17]);
+    mw1[17]=rol32(mw1[11]^mw1[1]^mw1[21]^mw1[17],2);
+    round_mj(ms1,mw1[17]);
+    mw2[17]=rol32(mw2[11]^mw2[1]^mw2[21]^mw2[17],2);
+    round_mj(ms2,mw2[17]);
+    mw3[17]=rol32(mw3[11]^mw3[1]^mw3[21]^mw3[17],2);
+    round_mj(ms3,mw3[17]);
+    mw0[18]=rol32(mw0[12]^mw0[2]^mw0[22]^mw0[18],2);
+    round_mj(ms0,mw0[18]);
+    mw1[18]=rol32(mw1[12]^mw1[2]^mw1[22]^mw1[18],2);
+    round_mj(ms1,mw1[18]);
+    mw2[18]=rol32(mw2[12]^mw2[2]^mw2[22]^mw2[18],2);
+    round_mj(ms2,mw2[18]);
+    mw3[18]=rol32(mw3[12]^mw3[2]^mw3[22]^mw3[18],2);
+    round_mj(ms3,mw3[18]);
+    mw0[19]=rol32(mw0[13]^mw0[3]^mw0[23]^mw0[19],2);
+    round_mj(ms0,mw0[19]);
+    mw1[19]=rol32(mw1[13]^mw1[3]^mw1[23]^mw1[19],2);
+    round_mj(ms1,mw1[19]);
+    mw2[19]=rol32(mw2[13]^mw2[3]^mw2[23]^mw2[19],2);
+    round_mj(ms2,mw2[19]);
+    mw3[19]=rol32(mw3[13]^mw3[3]^mw3[23]^mw3[19],2);
+    round_mj(ms3,mw3[19]);
+    mw0[20]=rol32(mw0[14]^mw0[4]^mw0[24]^mw0[20],2);
+    round_mj(ms0,mw0[20]);
+    mw1[20]=rol32(mw1[14]^mw1[4]^mw1[24]^mw1[20],2);
+    round_mj(ms1,mw1[20]);
+    mw2[20]=rol32(mw2[14]^mw2[4]^mw2[24]^mw2[20],2);
+    round_mj(ms2,mw2[20]);
+    mw3[20]=rol32(mw3[14]^mw3[4]^mw3[24]^mw3[20],2);
+    round_mj(ms3,mw3[20]);
+    mw0[21]=rol32(mw0[15]^mw0[5]^mw0[25]^mw0[21],2);
+    round_mj(ms0,mw0[21]);
+    mw1[21]=rol32(mw1[15]^mw1[5]^mw1[25]^mw1[21],2);
+    round_mj(ms1,mw1[21]);
+    mw2[21]=rol32(mw2[15]^mw2[5]^mw2[25]^mw2[21],2);
+    round_mj(ms2,mw2[21]);
+    mw3[21]=rol32(mw3[15]^mw3[5]^mw3[25]^mw3[21],2);
+    round_mj(ms3,mw3[21]);
+    mw0[22]=rol32(mw0[16]^mw0[6]^mw0[26]^mw0[22],2);
+    round_mj(ms0,mw0[22]);
+    mw1[22]=rol32(mw1[16]^mw1[6]^mw1[26]^mw1[22],2);
+    round_mj(ms1,mw1[22]);
+    mw2[22]=rol32(mw2[16]^mw2[6]^mw2[26]^mw2[22],2);
+    round_mj(ms2,mw2[22]);
+    mw3[22]=rol32(mw3[16]^mw3[6]^mw3[26]^mw3[22],2);
+    round_mj(ms3,mw3[22]);
+    mw0[23]=rol32(mw0[17]^mw0[7]^mw0[27]^mw0[23],2);
+    round_mj(ms0,mw0[23]);
+    mw1[23]=rol32(mw1[17]^mw1[7]^mw1[27]^mw1[23],2);
+    round_mj(ms1,mw1[23]);
+    mw2[23]=rol32(mw2[17]^mw2[7]^mw2[27]^mw2[23],2);
+    round_mj(ms2,mw2[23]);
+    mw3[23]=rol32(mw3[17]^mw3[7]^mw3[27]^mw3[23],2);
+    round_mj(ms3,mw3[23]);
+    mw0[24]=rol32(mw0[18]^mw0[8]^mw0[28]^mw0[24],2);
+    round_mj(ms0,mw0[24]);
+    mw1[24]=rol32(mw1[18]^mw1[8]^mw1[28]^mw1[24],2);
+    round_mj(ms1,mw1[24]);
+    mw2[24]=rol32(mw2[18]^mw2[8]^mw2[28]^mw2[24],2);
+    round_mj(ms2,mw2[24]);
+    mw3[24]=rol32(mw3[18]^mw3[8]^mw3[28]^mw3[24],2);
+    round_mj(ms3,mw3[24]);
+    mw0[25]=rol32(mw0[19]^mw0[9]^mw0[29]^mw0[25],2);
+    round_mj(ms0,mw0[25]);
+    mw1[25]=rol32(mw1[19]^mw1[9]^mw1[29]^mw1[25],2);
+    round_mj(ms1,mw1[25]);
+    mw2[25]=rol32(mw2[19]^mw2[9]^mw2[29]^mw2[25],2);
+    round_mj(ms2,mw2[25]);
+    mw3[25]=rol32(mw3[19]^mw3[9]^mw3[29]^mw3[25],2);
+    round_mj(ms3,mw3[25]);
+    mw0[26]=rol32(mw0[20]^mw0[10]^mw0[30]^mw0[26],2);
+    round_mj(ms0,mw0[26]);
+    mw1[26]=rol32(mw1[20]^mw1[10]^mw1[30]^mw1[26],2);
+    round_mj(ms1,mw1[26]);
+    mw2[26]=rol32(mw2[20]^mw2[10]^mw2[30]^mw2[26],2);
+    round_mj(ms2,mw2[26]);
+    mw3[26]=rol32(mw3[20]^mw3[10]^mw3[30]^mw3[26],2);
+    round_mj(ms3,mw3[26]);
+    mw0[27]=rol32(mw0[21]^mw0[11]^mw0[31]^mw0[27],2);
+    round_mj(ms0,mw0[27]);
+    mw1[27]=rol32(mw1[21]^mw1[11]^mw1[31]^mw1[27],2);
+    round_mj(ms1,mw1[27]);
+    mw2[27]=rol32(mw2[21]^mw2[11]^mw2[31]^mw2[27],2);
+    round_mj(ms2,mw2[27]);
+    mw3[27]=rol32(mw3[21]^mw3[11]^mw3[31]^mw3[27],2);
+    round_mj(ms3,mw3[27]);
+    mw0[28]=rol32(mw0[22]^mw0[12]^mw0[0]^mw0[28],2);
+    round_pa3(ms0,mw0[28]);
+    mw1[28]=rol32(mw1[22]^mw1[12]^mw1[0]^mw1[28],2);
+    round_pa3(ms1,mw1[28]);
+    mw2[28]=rol32(mw2[22]^mw2[12]^mw2[0]^mw2[28],2);
+    round_pa3(ms2,mw2[28]);
+    mw3[28]=rol32(mw3[22]^mw3[12]^mw3[0]^mw3[28],2);
+    round_pa3(ms3,mw3[28]);
+    mw0[29]=rol32(mw0[23]^mw0[13]^mw0[1]^mw0[29],2);
+    round_pa3(ms0,mw0[29]);
+    mw1[29]=rol32(mw1[23]^mw1[13]^mw1[1]^mw1[29],2);
+    round_pa3(ms1,mw1[29]);
+    mw2[29]=rol32(mw2[23]^mw2[13]^mw2[1]^mw2[29],2);
+    round_pa3(ms2,mw2[29]);
+    mw3[29]=rol32(mw3[23]^mw3[13]^mw3[1]^mw3[29],2);
+    round_pa3(ms3,mw3[29]);
+    mw0[30]=rol32(mw0[24]^mw0[14]^mw0[2]^mw0[30],2);
+    round_pa3(ms0,mw0[30]);
+    mw1[30]=rol32(mw1[24]^mw1[14]^mw1[2]^mw1[30],2);
+    round_pa3(ms1,mw1[30]);
+    mw2[30]=rol32(mw2[24]^mw2[14]^mw2[2]^mw2[30],2);
+    round_pa3(ms2,mw2[30]);
+    mw3[30]=rol32(mw3[24]^mw3[14]^mw3[2]^mw3[30],2);
+    round_pa3(ms3,mw3[30]);
+    mw0[31]=rol32(mw0[25]^mw0[15]^mw0[3]^mw0[31],2);
+    round_pa3(ms0,mw0[31]);
+    mw1[31]=rol32(mw1[25]^mw1[15]^mw1[3]^mw1[31],2);
+    round_pa3(ms1,mw1[31]);
+    mw2[31]=rol32(mw2[25]^mw2[15]^mw2[3]^mw2[31],2);
+    round_pa3(ms2,mw2[31]);
+    mw3[31]=rol32(mw3[25]^mw3[15]^mw3[3]^mw3[31],2);
+    round_pa3(ms3,mw3[31]);
+    mw0[0]=rol32(mw0[26]^mw0[16]^mw0[4]^mw0[0],2);
+    round_pa3(ms0,mw0[0]);
+    mw1[0]=rol32(mw1[26]^mw1[16]^mw1[4]^mw1[0],2);
+    round_pa3(ms1,mw1[0]);
+    mw2[0]=rol32(mw2[26]^mw2[16]^mw2[4]^mw2[0],2);
+    round_pa3(ms2,mw2[0]);
+    mw3[0]=rol32(mw3[26]^mw3[16]^mw3[4]^mw3[0],2);
+    round_pa3(ms3,mw3[0]);
+    mw0[1]=rol32(mw0[27]^mw0[17]^mw0[5]^mw0[1],2);
+    round_pa3(ms0,mw0[1]);
+    mw1[1]=rol32(mw1[27]^mw1[17]^mw1[5]^mw1[1],2);
+    round_pa3(ms1,mw1[1]);
+    mw2[1]=rol32(mw2[27]^mw2[17]^mw2[5]^mw2[1],2);
+    round_pa3(ms2,mw2[1]);
+    mw3[1]=rol32(mw3[27]^mw3[17]^mw3[5]^mw3[1],2);
+    round_pa3(ms3,mw3[1]);
+    mw0[2]=rol32(mw0[28]^mw0[18]^mw0[6]^mw0[2],2);
+    round_pa3(ms0,mw0[2]);
+    mw1[2]=rol32(mw1[28]^mw1[18]^mw1[6]^mw1[2],2);
+    round_pa3(ms1,mw1[2]);
+    mw2[2]=rol32(mw2[28]^mw2[18]^mw2[6]^mw2[2],2);
+    round_pa3(ms2,mw2[2]);
+    mw3[2]=rol32(mw3[28]^mw3[18]^mw3[6]^mw3[2],2);
+    round_pa3(ms3,mw3[2]);
+    mw0[3]=rol32(mw0[29]^mw0[19]^mw0[7]^mw0[3],2);
+    round_pa3(ms0,mw0[3]);
+    mw1[3]=rol32(mw1[29]^mw1[19]^mw1[7]^mw1[3],2);
+    round_pa3(ms1,mw1[3]);
+    mw2[3]=rol32(mw2[29]^mw2[19]^mw2[7]^mw2[3],2);
+    round_pa3(ms2,mw2[3]);
+    mw3[3]=rol32(mw3[29]^mw3[19]^mw3[7]^mw3[3],2);
+    round_pa3(ms3,mw3[3]);
+    mw0[4]=rol32(mw0[30]^mw0[20]^mw0[8]^mw0[4],2);
+    round_pa3(ms0,mw0[4]);
+    mw1[4]=rol32(mw1[30]^mw1[20]^mw1[8]^mw1[4],2);
+    round_pa3(ms1,mw1[4]);
+    mw2[4]=rol32(mw2[30]^mw2[20]^mw2[8]^mw2[4],2);
+    round_pa3(ms2,mw2[4]);
+    mw3[4]=rol32(mw3[30]^mw3[20]^mw3[8]^mw3[4],2);
+    round_pa3(ms3,mw3[4]);
+    mw0[5]=rol32(mw0[31]^mw0[21]^mw0[9]^mw0[5],2);
+    round_pa3(ms0,mw0[5]);
+    mw1[5]=rol32(mw1[31]^mw1[21]^mw1[9]^mw1[5],2);
+    round_pa3(ms1,mw1[5]);
+    mw2[5]=rol32(mw2[31]^mw2[21]^mw2[9]^mw2[5],2);
+    round_pa3(ms2,mw2[5]);
+    mw3[5]=rol32(mw3[31]^mw3[21]^mw3[9]^mw3[5],2);
+    round_pa3(ms3,mw3[5]);
+    mw0[6]=rol32(mw0[0]^mw0[22]^mw0[10]^mw0[6],2);
+    round_pa3(ms0,mw0[6]);
+    mw1[6]=rol32(mw1[0]^mw1[22]^mw1[10]^mw1[6],2);
+    round_pa3(ms1,mw1[6]);
+    mw2[6]=rol32(mw2[0]^mw2[22]^mw2[10]^mw2[6],2);
+    round_pa3(ms2,mw2[6]);
+    mw3[6]=rol32(mw3[0]^mw3[22]^mw3[10]^mw3[6],2);
+    round_pa3(ms3,mw3[6]);
+    mw0[7]=rol32(mw0[1]^mw0[23]^mw0[11]^mw0[7],2);
+    round_pa3(ms0,mw0[7]);
+    mw1[7]=rol32(mw1[1]^mw1[23]^mw1[11]^mw1[7],2);
+    round_pa3(ms1,mw1[7]);
+    mw2[7]=rol32(mw2[1]^mw2[23]^mw2[11]^mw2[7],2);
+    round_pa3(ms2,mw2[7]);
+    mw3[7]=rol32(mw3[1]^mw3[23]^mw3[11]^mw3[7],2);
+    round_pa3(ms3,mw3[7]);
+    mw0[8]=rol32(mw0[2]^mw0[24]^mw0[12]^mw0[8],2);
+    round_pa3(ms0,mw0[8]);
+    mw1[8]=rol32(mw1[2]^mw1[24]^mw1[12]^mw1[8],2);
+    round_pa3(ms1,mw1[8]);
+    mw2[8]=rol32(mw2[2]^mw2[24]^mw2[12]^mw2[8],2);
+    round_pa3(ms2,mw2[8]);
+    mw3[8]=rol32(mw3[2]^mw3[24]^mw3[12]^mw3[8],2);
+    round_pa3(ms3,mw3[8]);
+    mw0[9]=rol32(mw0[3]^mw0[25]^mw0[13]^mw0[9],2);
+    round_pa3(ms0,mw0[9]);
+    mw1[9]=rol32(mw1[3]^mw1[25]^mw1[13]^mw1[9],2);
+    round_pa3(ms1,mw1[9]);
+    mw2[9]=rol32(mw2[3]^mw2[25]^mw2[13]^mw2[9],2);
+    round_pa3(ms2,mw2[9]);
+    mw3[9]=rol32(mw3[3]^mw3[25]^mw3[13]^mw3[9],2);
+    round_pa3(ms3,mw3[9]);
+    mw0[10]=rol32(mw0[4]^mw0[26]^mw0[14]^mw0[10],2);
+    round_pa3(ms0,mw0[10]);
+    mw1[10]=rol32(mw1[4]^mw1[26]^mw1[14]^mw1[10],2);
+    round_pa3(ms1,mw1[10]);
+    mw2[10]=rol32(mw2[4]^mw2[26]^mw2[14]^mw2[10],2);
+    round_pa3(ms2,mw2[10]);
+    mw3[10]=rol32(mw3[4]^mw3[26]^mw3[14]^mw3[10],2);
+    round_pa3(ms3,mw3[10]);
+    mw0[11]=rol32(mw0[5]^mw0[27]^mw0[15]^mw0[11],2);
+    round_pa3(ms0,mw0[11]);
+    mw1[11]=rol32(mw1[5]^mw1[27]^mw1[15]^mw1[11],2);
+    round_pa3(ms1,mw1[11]);
+    mw2[11]=rol32(mw2[5]^mw2[27]^mw2[15]^mw2[11],2);
+    round_pa3(ms2,mw2[11]);
+    mw3[11]=rol32(mw3[5]^mw3[27]^mw3[15]^mw3[11],2);
+    round_pa3(ms3,mw3[11]);
+    mw0[12]=rol32(mw0[6]^mw0[28]^mw0[16]^mw0[12],2);
+    round_pa3(ms0,mw0[12]);
+    mw1[12]=rol32(mw1[6]^mw1[28]^mw1[16]^mw1[12],2);
+    round_pa3(ms1,mw1[12]);
+    mw2[12]=rol32(mw2[6]^mw2[28]^mw2[16]^mw2[12],2);
+    round_pa3(ms2,mw2[12]);
+    mw3[12]=rol32(mw3[6]^mw3[28]^mw3[16]^mw3[12],2);
+    round_pa3(ms3,mw3[12]);
+    mw0[13]=rol32(mw0[7]^mw0[29]^mw0[17]^mw0[13],2);
+    round_pa3(ms0,mw0[13]);
+    mw1[13]=rol32(mw1[7]^mw1[29]^mw1[17]^mw1[13],2);
+    round_pa3(ms1,mw1[13]);
+    mw2[13]=rol32(mw2[7]^mw2[29]^mw2[17]^mw2[13],2);
+    round_pa3(ms2,mw2[13]);
+    mw3[13]=rol32(mw3[7]^mw3[29]^mw3[17]^mw3[13],2);
+    round_pa3(ms3,mw3[13]);
+    mw0[14]=rol32(mw0[8]^mw0[30]^mw0[18]^mw0[14],2);
+    round_pa3(ms0,mw0[14]);
+    mw1[14]=rol32(mw1[8]^mw1[30]^mw1[18]^mw1[14],2);
+    round_pa3(ms1,mw1[14]);
+    mw2[14]=rol32(mw2[8]^mw2[30]^mw2[18]^mw2[14],2);
+    round_pa3(ms2,mw2[14]);
+    mw3[14]=rol32(mw3[8]^mw3[30]^mw3[18]^mw3[14],2);
+    round_pa3(ms3,mw3[14]);
+    mw0[15]=rol32(mw0[9]^mw0[31]^mw0[19]^mw0[15],2);
+    round_pa3(ms0,mw0[15]);
+    mw1[15]=rol32(mw1[9]^mw1[31]^mw1[19]^mw1[15],2);
+    round_pa3(ms1,mw1[15]);
+    mw2[15]=rol32(mw2[9]^mw2[31]^mw2[19]^mw2[15],2);
+    round_pa3(ms2,mw2[15]);
+    mw3[15]=rol32(mw3[9]^mw3[31]^mw3[19]^mw3[15],2);
+    round_pa3(ms3,mw3[15]);
+    if(mactive0){
+      S digest{ms0.a+C_JOB.prestate[0],ms0.b+C_JOB.prestate[1],
+               ms0.c+C_JOB.prestate[2],ms0.d+C_JOB.prestate[3],
+               ms0.e+C_JOB.prestate[4]};
+      compress_suffix(digest,suffix_schedules,suffix_blocks);
+      if constexpr(DIAG){
+        if(mid0==diag_id){diag[0]=digest.a;diag[1]=digest.b;diag[2]=digest.c;
+          diag[3]=digest.d;diag[4]=digest.e;}
+      }else if(target_match_digest(digest))
+        atomicCAS(reinterpret_cast<unsigned long long*>(winner),
+                  static_cast<unsigned long long>(GSV_NO_WINNER),
+                  static_cast<unsigned long long>(mid0));
+    }
+    if(mactive1){
+      S digest{ms1.a+C_JOB.prestate[0],ms1.b+C_JOB.prestate[1],
+               ms1.c+C_JOB.prestate[2],ms1.d+C_JOB.prestate[3],
+               ms1.e+C_JOB.prestate[4]};
+      compress_suffix(digest,suffix_schedules,suffix_blocks);
+      if constexpr(DIAG){
+        if(mid1==diag_id){diag[0]=digest.a;diag[1]=digest.b;diag[2]=digest.c;
+          diag[3]=digest.d;diag[4]=digest.e;}
+      }else if(target_match_digest(digest))
+        atomicCAS(reinterpret_cast<unsigned long long*>(winner),
+                  static_cast<unsigned long long>(GSV_NO_WINNER),
+                  static_cast<unsigned long long>(mid1));
+    }
+    if(mactive2){
+      S digest{ms2.a+C_JOB.prestate[0],ms2.b+C_JOB.prestate[1],
+               ms2.c+C_JOB.prestate[2],ms2.d+C_JOB.prestate[3],
+               ms2.e+C_JOB.prestate[4]};
+      compress_suffix(digest,suffix_schedules,suffix_blocks);
+      if constexpr(DIAG){
+        if(mid2==diag_id){diag[0]=digest.a;diag[1]=digest.b;diag[2]=digest.c;
+          diag[3]=digest.d;diag[4]=digest.e;}
+      }else if(target_match_digest(digest))
+        atomicCAS(reinterpret_cast<unsigned long long*>(winner),
+                  static_cast<unsigned long long>(GSV_NO_WINNER),
+                  static_cast<unsigned long long>(mid2));
+    }
+    if(mactive3){
+      S digest{ms3.a+C_JOB.prestate[0],ms3.b+C_JOB.prestate[1],
+               ms3.c+C_JOB.prestate[2],ms3.d+C_JOB.prestate[3],
+               ms3.e+C_JOB.prestate[4]};
+      compress_suffix(digest,suffix_schedules,suffix_blocks);
+      if constexpr(DIAG){
+        if(mid3==diag_id){diag[0]=digest.a;diag[1]=digest.b;diag[2]=digest.c;
+          diag[3]=digest.d;diag[4]=digest.e;}
+      }else if(target_match_digest(digest))
+        atomicCAS(reinterpret_cast<unsigned long long*>(winner),
+                  static_cast<unsigned long long>(GSV_NO_WINNER),
+                  static_cast<unsigned long long>(mid3));
+    }
+  }
+}
+
 struct gsv_context {
   int32_t device = 0;
   gsv_job job{};
@@ -713,7 +1414,10 @@ struct gsv_context {
   size_t suffix_capacity_words = 0;
   uint32_t suffix_blocks = 0;
   bool header_mode = false;
+  bool masked_mode = false;
   gsv_nonce_policy nonce_policy = GSV_NONCE_NO_NUL;
+  uint32_t masked_pre11[5]{};
+  int multiprocessors = 0;
   uint64_t *winner = nullptr;
   uint32_t *diag = nullptr;
   cudaEvent_t begin = nullptr;
@@ -744,15 +1448,20 @@ static void expand_schedule(const uint32_t block[16], uint32_t w[80]) {
     w[t] = host_rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
 }
 
-static void partial12(const uint32_t state[5], const uint32_t block[16], uint32_t out[5]) {
+static void partial_rounds(const uint32_t state[5], const uint32_t block[16], int rounds,
+                           uint32_t out[5]) {
   uint32_t w[80];
   expand_schedule(block, w);
   uint32_t a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
-  for (int t = 0; t < 12; ++t) {
+  for (int t = 0; t < rounds; ++t) {
     uint32_t z = host_rol(a, 5) + ((b & c) | (~b & d)) + e + K0 + w[t];
     e = d; d = c; c = host_rol(b, 30); b = a; a = z;
   }
   out[0] = a; out[1] = b; out[2] = c; out[3] = d; out[4] = e;
+}
+
+static void partial12(const uint32_t state[5], const uint32_t block[16], uint32_t out[5]) {
+  partial_rounds(state, block, 12, out);
 }
 
 static std::vector<uint32_t> make_table() {
@@ -823,12 +1532,21 @@ template<int MODE, bool HEADER>
 static cudaError_t launch_search(uint64_t outer_base, uint64_t outer_count,
                                  const uint32_t *table, const uint32_t *suffix_schedules,
                                  uint32_t suffix_blocks, gsv_nonce_policy nonce_policy,
-                                 uint64_t *winner) {
+                                 uint64_t *winner, int domain) {
   const uint64_t groups = BLOCK / G;
   const uint32_t blocks = uint32_t((outer_count + groups - 1) / groups);
-  search_kernel<MODE, false, HEADER><<<blocks, BLOCK, DYNAMIC_SMEM>>>(
-      outer_base, outer_count, table, suffix_schedules, suffix_blocks, nonce_policy,
-      winner, 0, nullptr);
+  if (domain == 1)
+    search_kernel<MODE, false, HEADER, 1><<<blocks, BLOCK, DYNAMIC_SMEM>>>(
+        outer_base, outer_count, table, suffix_schedules, suffix_blocks, nonce_policy,
+        winner, 0, nullptr);
+  else if (domain == 2)
+    search_kernel<MODE, false, HEADER, 2><<<blocks, BLOCK, DYNAMIC_SMEM>>>(
+        outer_base, outer_count, table, suffix_schedules, suffix_blocks, nonce_policy,
+        winner, 0, nullptr);
+  else
+    search_kernel<MODE, false, HEADER, 0><<<blocks, BLOCK, DYNAMIC_SMEM>>>(
+        outer_base, outer_count, table, suffix_schedules, suffix_blocks, nonce_policy,
+        winner, 0, nullptr);
   return cudaGetLastError();
 }
 
@@ -896,6 +1614,11 @@ gsv_status gsv_context_create(int32_t device, const gsv_job *job, gsv_context **
   ctx->device = device;
   ctx->job = *job;
   if ((e = cudaSetDevice(device)) != cudaSuccess) { cleanup_context(ctx); return cuda_error(nullptr, e, "cudaSetDevice"); }
+  cudaDeviceProp properties{};
+  if ((e = cudaGetDeviceProperties(&properties, device)) != cudaSuccess) {
+    cleanup_context(ctx); return cuda_error(nullptr, e, "cudaGetDeviceProperties");
+  }
+  ctx->multiprocessors = properties.multiProcessorCount;
   try {
     std::vector<uint32_t> host_table = make_table();
     if (host_table.size() != 32u * 256u) { cleanup_context(ctx); set_error(nullptr, "delta table has unexpected size"); return GSV_INTERNAL_ERROR; }
@@ -930,6 +1653,7 @@ gsv_status gsv_context_set_job(gsv_context *ctx, const gsv_job *job) {
   std::lock_guard<std::mutex> lock(g_cuda_mutex);
   ctx->job = *job;
   ctx->header_mode = false;
+  ctx->masked_mode = false;
   ctx->suffix_blocks = 0;
   ctx->nonce_policy = GSV_NONCE_NO_NUL;
   ctx->error.clear();
@@ -979,8 +1703,77 @@ gsv_status gsv_context_set_header_job(gsv_context *ctx, const gsv_job *job,
     return cuda_error(ctx, e, "upload suffix schedules");
   ctx->job = *job;
   ctx->header_mode = true;
+  ctx->masked_mode = false;
   ctx->suffix_blocks = suffix_block_count;
   ctx->nonce_policy = GSV_NONCE_HEADER_SAFE;
+  ctx->error.clear();
+  return GSV_OK;
+}
+
+gsv_status gsv_context_set_masked_header_job(
+    gsv_context *ctx, const uint32_t prestate[5], const uint32_t base_words[16],
+    uint32_t target_bits, const uint32_t target_words[5],
+    const uint32_t *suffix_words, uint32_t suffix_block_count) {
+  if (!ctx || !prestate || !base_words || !target_words) {
+    set_error(ctx, "masked-header job received a null pointer");
+    return GSV_INVALID_ARGUMENT;
+  }
+  if (target_bits < 1 || target_bits > 160) {
+    set_error(ctx, "target_bits must be in 1..160");
+    return GSV_INVALID_ARGUMENT;
+  }
+  if (base_words[11] || base_words[12]) {
+    set_error(ctx, "masked-header candidate words W11 and W12 must be zero");
+    return GSV_INVALID_ARGUMENT;
+  }
+  if (suffix_block_count && !suffix_words) {
+    set_error(ctx, "suffix_words is null for a non-empty suffix");
+    return GSV_INVALID_ARGUMENT;
+  }
+  if (suffix_block_count > (UINT32_MAX / 80u)) {
+    set_error(ctx, "suffix block count is too large");
+    return GSV_INVALID_ARGUMENT;
+  }
+
+  std::vector<uint32_t> schedules;
+  try {
+    schedules.resize(size_t(suffix_block_count) * 80u);
+    for (uint32_t block = 0; block < suffix_block_count; ++block)
+      expand_schedule(suffix_words + size_t(block) * 16u,
+                      schedules.data() + size_t(block) * 80u);
+  } catch (const std::bad_alloc &) {
+    set_error(ctx, "host suffix-schedule allocation failed");
+    return GSV_INTERNAL_ERROR;
+  }
+
+  std::lock_guard<std::mutex> lock(g_cuda_mutex);
+  cudaError_t e = cudaSetDevice(ctx->device);
+  if (e != cudaSuccess) return cuda_error(ctx, e, "cudaSetDevice");
+  const size_t words = schedules.size();
+  if (words > ctx->suffix_capacity_words) {
+    uint32_t *replacement = nullptr;
+    if ((e = cudaMalloc(&replacement, words * sizeof(uint32_t))) != cudaSuccess)
+      return cuda_error(ctx, e, "allocate suffix schedules");
+    if (ctx->suffix_schedules) cudaFree(ctx->suffix_schedules);
+    ctx->suffix_schedules = replacement;
+    ctx->suffix_capacity_words = words;
+  }
+  if (words && (e = cudaMemcpy(ctx->suffix_schedules, schedules.data(), words * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice)) != cudaSuccess)
+    return cuda_error(ctx, e, "upload suffix schedules");
+
+  std::memset(&ctx->job, 0, sizeof(ctx->job));
+  ctx->job.abi_version = GSV_ABI_VERSION;
+  std::memcpy(ctx->job.prestate, prestate, 5 * sizeof(uint32_t));
+  std::memcpy(ctx->job.base_words, base_words, 16 * sizeof(uint32_t));
+  std::memcpy(ctx->job.target_words, target_words, 5 * sizeof(uint32_t));
+  ctx->job.target_bits = target_bits;
+  masks_for_bits(target_bits, ctx->job.target_masks);
+  partial_rounds(prestate, base_words, 11, ctx->masked_pre11);
+  ctx->suffix_blocks = suffix_block_count;
+  ctx->header_mode = false;
+  ctx->masked_mode = true;
+  ctx->nonce_policy = GSV_NONCE_PRINTABLE_ASCII;
   ctx->error.clear();
   return GSV_OK;
 }
@@ -998,13 +1791,20 @@ gsv_status gsv_context_set_nonce_policy(gsv_context *ctx, gsv_nonce_policy polic
   return GSV_OK;
 }
 
-gsv_status gsv_search(gsv_context *ctx, uint64_t outer_base, uint64_t outer_count,
-                      gsv_search_result *result) {
+static gsv_status search_impl(gsv_context *ctx, uint64_t outer_base, uint64_t outer_count,
+                              gsv_search_result *result, int domain) {
   if (!ctx || !result) { set_error(ctx, "gsv_search received a null pointer"); return GSV_INVALID_ARGUMENT; }
+  if (ctx->masked_mode) {
+    set_error(ctx, "masked-header jobs use gsv_search_masked_header");
+    return GSV_INVALID_ARGUMENT;
+  }
   std::memset(result, 0, sizeof(*result));
   result->candidate = GSV_NO_WINNER;
-  if (!outer_count || outer_base > 0xffffffffull || outer_count > 0x100000000ull - outer_base) {
-    set_error(ctx, "outer range must be a non-empty subset of 0..2^32");
+  const uint64_t outer_limit = domain == 1 ? 95ull * 95ull * 95ull * 95ull
+                               : domain == 2 ? 1ull << 20
+                                             : 0x100000000ull;
+  if (!outer_count || outer_base >= outer_limit || outer_count > outer_limit - outer_base) {
+    set_error(ctx, "outer range is outside the selected candidate domain");
     return GSV_INVALID_ARGUMENT;
   }
   std::lock_guard<std::mutex> lock(g_cuda_mutex);
@@ -1020,23 +1820,23 @@ gsv_status gsv_search(gsv_context *ctx, uint64_t outer_base, uint64_t outer_coun
   if (ctx->header_mode) {
     if (ctx->job.target_bits < 32)
       e = launch_search<0, true>(outer_base, outer_count, ctx->table, ctx->suffix_schedules,
-                                 ctx->suffix_blocks, ctx->nonce_policy, ctx->winner);
+                                 ctx->suffix_blocks, ctx->nonce_policy, ctx->winner, domain);
     else if (ctx->job.target_bits == 32)
       e = launch_search<1, true>(outer_base, outer_count, ctx->table, ctx->suffix_schedules,
-                                 ctx->suffix_blocks, ctx->nonce_policy, ctx->winner);
+                                 ctx->suffix_blocks, ctx->nonce_policy, ctx->winner, domain);
     else
       e = launch_search<2, true>(outer_base, outer_count, ctx->table, ctx->suffix_schedules,
-                                 ctx->suffix_blocks, ctx->nonce_policy, ctx->winner);
+                                 ctx->suffix_blocks, ctx->nonce_policy, ctx->winner, domain);
   } else {
     if (ctx->job.target_bits < 32)
       e = launch_search<0, false>(outer_base, outer_count, ctx->table, nullptr, 0,
-                                  ctx->nonce_policy, ctx->winner);
+                                  ctx->nonce_policy, ctx->winner, domain);
     else if (ctx->job.target_bits == 32)
       e = launch_search<1, false>(outer_base, outer_count, ctx->table, nullptr, 0,
-                                  ctx->nonce_policy, ctx->winner);
+                                  ctx->nonce_policy, ctx->winner, domain);
     else
       e = launch_search<2, false>(outer_base, outer_count, ctx->table, nullptr, 0,
-                                  ctx->nonce_policy, ctx->winner);
+                                  ctx->nonce_policy, ctx->winner, domain);
   }
   if (e != cudaSuccess) return cuda_error(ctx, e, "launch search kernel");
   if ((e = cudaEventRecord(ctx->end)) != cudaSuccess || (e = cudaEventSynchronize(ctx->end)) != cudaSuccess)
@@ -1045,15 +1845,115 @@ gsv_status gsv_search(gsv_context *ctx, uint64_t outer_base, uint64_t outer_coun
     return cuda_error(ctx, e, "measure search kernel");
   if ((e = cudaMemcpy(&result->candidate, ctx->winner, sizeof(result->candidate), cudaMemcpyDeviceToHost)) != cudaSuccess)
     return cuda_error(ctx, e, "copy winner");
-  result->candidates_hashed = outer_count * 256ull;
+  const uint64_t inner_count = domain == 1 ? 95ull : domain == 2 ? 32ull : 256ull;
+  result->candidates_hashed = outer_count * inner_count;
   if (result->milliseconds > 0.0f)
     result->billions_per_second = float(double(result->candidates_hashed) / (double(result->milliseconds) * 1.0e6));
   result->found = result->candidate != GSV_NO_WINNER;
   return result->found ? GSV_FOUND : GSV_NOT_FOUND;
 }
 
+gsv_status gsv_search(gsv_context *ctx, uint64_t outer_base, uint64_t outer_count,
+                      gsv_search_result *result) {
+  return search_impl(ctx, outer_base, outer_count, result, 0);
+}
+
+gsv_status gsv_search_printable(gsv_context *ctx, uint64_t outer_base, uint64_t outer_count,
+                                gsv_search_result *result) {
+  return search_impl(ctx, outer_base, outer_count, result, 1);
+}
+
+gsv_status gsv_search_printable_mask(gsv_context *ctx, uint64_t outer_base,
+                                     uint64_t outer_count, gsv_search_result *result) {
+  return search_impl(ctx, outer_base, outer_count, result, 2);
+}
+
+gsv_status gsv_search_masked_header(gsv_context *ctx, uint64_t candidate_base,
+                                    uint64_t candidate_count, gsv_search_result *result) {
+  if (!ctx || !result) {
+    set_error(ctx, "gsv_search_masked_header received a null pointer");
+    return GSV_INVALID_ARGUMENT;
+  }
+  if (!ctx->masked_mode) {
+    set_error(ctx, "context does not contain a masked-header job");
+    return GSV_INVALID_ARGUMENT;
+  }
+  if (!candidate_count || candidate_base >= (1ull << 40) ||
+      candidate_count > (1ull << 40) - candidate_base) {
+    set_error(ctx, "candidate range must be a non-empty subset of 0..2^40");
+    return GSV_INVALID_ARGUMENT;
+  }
+  std::memset(result, 0, sizeof(*result));
+  result->candidate = GSV_NO_WINNER;
+  std::lock_guard<std::mutex> lock(g_cuda_mutex);
+  ctx->error.clear();
+  cudaError_t e;
+  if ((e = cudaSetDevice(ctx->device)) != cudaSuccess) return cuda_error(ctx, e, "cudaSetDevice");
+  if ((e = cudaMemcpyToSymbol(C_JOB, &ctx->job, sizeof(ctx->job))) != cudaSuccess)
+    return cuda_error(ctx, e, "cudaMemcpyToSymbol(masked job)");
+  if ((e = cudaMemcpyToSymbol(C_PRE11, ctx->masked_pre11, sizeof(ctx->masked_pre11))) != cudaSuccess)
+    return cuda_error(ctx, e, "cudaMemcpyToSymbol(masked pre11)");
+  const uint64_t none = GSV_NO_WINNER;
+  if ((e = cudaMemcpy(ctx->winner, &none, sizeof(none), cudaMemcpyHostToDevice)) != cudaSuccess)
+    return cuda_error(ctx, e, "reset winner");
+  if ((e = cudaEventRecord(ctx->begin)) != cudaSuccess) return cuda_error(ctx, e, "record begin event");
+  const uint32_t blocks = uint32_t(ctx->multiprocessors * 4);
+  masked8_kernel<false><<<blocks, MASKED_BLOCK>>>(
+      candidate_base, candidate_count, ctx->suffix_schedules, ctx->suffix_blocks,
+      ctx->winner, 0, nullptr);
+  if ((e = cudaGetLastError()) != cudaSuccess) return cuda_error(ctx, e, "launch masked-header kernel");
+  if ((e = cudaEventRecord(ctx->end)) != cudaSuccess ||
+      (e = cudaEventSynchronize(ctx->end)) != cudaSuccess)
+    return cuda_error(ctx, e, "wait for masked-header kernel");
+  if ((e = cudaEventElapsedTime(&result->milliseconds, ctx->begin, ctx->end)) != cudaSuccess)
+    return cuda_error(ctx, e, "measure masked-header kernel");
+  if ((e = cudaMemcpy(&result->candidate, ctx->winner, sizeof(result->candidate),
+                      cudaMemcpyDeviceToHost)) != cudaSuccess)
+    return cuda_error(ctx, e, "copy winner");
+  result->candidates_hashed = candidate_count;
+  if (result->milliseconds > 0.0f)
+    result->billions_per_second =
+        float(double(candidate_count) / (double(result->milliseconds) * 1.0e6));
+  result->found = result->candidate != GSV_NO_WINNER;
+  return result->found ? GSV_FOUND : GSV_NOT_FOUND;
+}
+
+gsv_status gsv_digest_masked_header(gsv_context *ctx, uint64_t candidate,
+                                    uint32_t digest[5]) {
+  if (!ctx || !digest) {
+    set_error(ctx, "gsv_digest_masked_header received a null pointer");
+    return GSV_INVALID_ARGUMENT;
+  }
+  if (!ctx->masked_mode) {
+    set_error(ctx, "context does not contain a masked-header job");
+    return GSV_INVALID_ARGUMENT;
+  }
+  if (candidate >= (1ull << 40)) {
+    set_error(ctx, "candidate must fit in 40 bits");
+    return GSV_INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> lock(g_cuda_mutex);
+  ctx->error.clear();
+  cudaError_t e;
+  if ((e = cudaSetDevice(ctx->device)) != cudaSuccess) return cuda_error(ctx, e, "cudaSetDevice");
+  if ((e = cudaMemcpyToSymbol(C_JOB, &ctx->job, sizeof(ctx->job))) != cudaSuccess ||
+      (e = cudaMemcpyToSymbol(C_PRE11, ctx->masked_pre11, sizeof(ctx->masked_pre11))) != cudaSuccess)
+    return cuda_error(ctx, e, "upload masked-header diagnostic job");
+  masked8_kernel<true><<<1, MASKED_BLOCK>>>(candidate, 1, ctx->suffix_schedules,
+                                            ctx->suffix_blocks, nullptr, candidate, ctx->diag);
+  if ((e = cudaGetLastError()) != cudaSuccess || (e = cudaDeviceSynchronize()) != cudaSuccess)
+    return cuda_error(ctx, e, "masked-header digest kernel");
+  if ((e = cudaMemcpy(digest, ctx->diag, 5 * sizeof(uint32_t), cudaMemcpyDeviceToHost)) != cudaSuccess)
+    return cuda_error(ctx, e, "copy masked-header digest");
+  return GSV_OK;
+}
+
 gsv_status gsv_digest(gsv_context *ctx, uint64_t candidate, uint32_t digest[5]) {
   if (!ctx || !digest) { set_error(ctx, "gsv_digest received a null pointer"); return GSV_INVALID_ARGUMENT; }
+  if (ctx->masked_mode) {
+    set_error(ctx, "masked-header jobs use gsv_digest_masked_header");
+    return GSV_INVALID_ARGUMENT;
+  }
   if (candidate >= (1ull << 40)) { set_error(ctx, "candidate must fit in 40 bits"); return GSV_INVALID_ARGUMENT; }
   std::lock_guard<std::mutex> lock(g_cuda_mutex);
   ctx->error.clear();
@@ -1062,11 +1962,11 @@ gsv_status gsv_digest(gsv_context *ctx, uint64_t candidate, uint32_t digest[5]) 
   gsv_status uploaded = upload_job(ctx);
   if (uploaded != GSV_OK) return uploaded;
   if (ctx->header_mode)
-    search_kernel<0, true, true><<<1, BLOCK, DYNAMIC_SMEM>>>(
+    search_kernel<0, true, true, 0><<<1, BLOCK, DYNAMIC_SMEM>>>(
         candidate >> 8, 1, ctx->table, ctx->suffix_schedules, ctx->suffix_blocks,
         ctx->nonce_policy, nullptr, unsigned(candidate & 0xffu), ctx->diag);
   else
-    search_kernel<0, true, false><<<1, BLOCK, DYNAMIC_SMEM>>>(
+    search_kernel<0, true, false, 0><<<1, BLOCK, DYNAMIC_SMEM>>>(
         candidate >> 8, 1, ctx->table, nullptr, 0, ctx->nonce_policy, nullptr,
         unsigned(candidate & 0xffu), ctx->diag);
   if ((e = cudaGetLastError()) != cudaSuccess || (e = cudaDeviceSynchronize()) != cudaSuccess)

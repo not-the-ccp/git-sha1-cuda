@@ -33,6 +33,9 @@ SHA1_K = (0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6)
 RAW_NONCE_BYTES = 5
 RAW_NONCE_BITS = RAW_NONCE_BYTES * 8
 RAW_NONCE_BLOCK_OFFSET = 48
+MASKED_NONCE_BYTES = 8
+MASKED_NONCE_BITS = 40
+MASKED_NONCE_BLOCK_OFFSET = 44
 
 
 def rol32(value: int, amount: int) -> int:
@@ -300,6 +303,14 @@ def nonce_is_header_safe(nonce: bytes) -> bool:
     return b"\0" not in nonce and b"\n" not in nonce
 
 
+def masked_candidate_nonce(candidate: int) -> bytes:
+    """Map 40 candidate bits to eight printable 0x20..0x3f bytes."""
+
+    if not 0 <= candidate < (1 << MASKED_NONCE_BITS):
+        raise ValueError("candidate must be an unsigned 40-bit integer")
+    return bytes(0x20 | ((candidate >> shift) & 0x1F) for shift in range(35, -1, -5))
+
+
 @dataclasses.dataclass(frozen=True)
 class RawTailJob:
     """Complete host-side description of a final-one-block raw nonce job."""
@@ -560,6 +571,119 @@ class HeaderJob:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class MaskedHeaderJob:
+    """A custom-header job with eight printable bytes carrying 40 bits."""
+
+    source_payload: bytes
+    payload_template: bytes
+    object_template: bytes
+    nonce_payload_offset: int
+    nonce_object_offset: int
+    mutable_block: int
+    filler_bytes: int
+    mutable_block_template: bytes
+    suffix_blocks: tuple[bytes, ...]
+    prestate: tuple[int, ...]
+    target: TargetPrefix
+    header_name: bytes
+    value_prefix: bytes
+    filler_byte: bytes
+    placeholder: bytes
+
+    def __post_init__(self) -> None:
+        if len(self.mutable_block_template) != 64:
+            raise ValueError("mutable block template must be exactly one block")
+        if self.nonce_object_offset % 64 != MASKED_NONCE_BLOCK_OFFSET:
+            raise ValueError("masked nonce must begin at mutable-block offset 44")
+        if len(self.prestate) != 5:
+            raise ValueError("prestate must contain five words")
+        if any(len(block) != 64 for block in self.suffix_blocks):
+            raise ValueError("masked-header suffix blocks must be complete SHA-1 blocks")
+
+    @property
+    def base_words(self) -> tuple[int, ...]:
+        return block_words(self.mutable_block_template)
+
+    @property
+    def suffix_words(self) -> tuple[tuple[int, ...], ...]:
+        return tuple(block_words(block) for block in self.suffix_blocks)
+
+    def materialize_payload(self, candidate: int) -> bytes:
+        result = bytearray(self.payload_template)
+        result[self.nonce_payload_offset : self.nonce_payload_offset + MASKED_NONCE_BYTES] = masked_candidate_nonce(candidate)
+        return bytes(result)
+
+    def materialize_object(self, candidate: int) -> bytes:
+        return serialize_git_commit(self.materialize_payload(candidate))
+
+    def materialize_mutable_block(self, candidate: int) -> bytes:
+        result = bytearray(self.mutable_block_template)
+        result[
+            MASKED_NONCE_BLOCK_OFFSET : MASKED_NONCE_BLOCK_OFFSET + MASKED_NONCE_BYTES
+        ] = masked_candidate_nonce(candidate)
+        return bytes(result)
+
+    def digest(self, candidate: int) -> bytes:
+        return hashlib.sha1(self.materialize_object(candidate)).digest()
+
+    def digest_from_prestate(self, candidate: int) -> bytes:
+        state = sha1_compress(self.prestate, self.materialize_mutable_block(candidate))
+        for block in self.suffix_blocks:
+            state = sha1_compress(state, block)
+        return b"".join(word.to_bytes(4, "big") for word in state)
+
+    def verify_candidate(self, candidate: int) -> bytes:
+        oracle = self.digest(candidate)
+        independent = self.digest_from_prestate(candidate)
+        if oracle != independent:
+            raise RuntimeError("hashlib and independent masked-header SHA-1 calculations disagree")
+        if not self.target.matches(oracle):
+            raise ValueError("candidate digest does not match the requested prefix")
+        return oracle
+
+    def manifest(self) -> dict[str, object]:
+        return {
+            "schema": "git-sha1-masked-header-job-v1",
+            "hash": "sha1",
+            "object_type": "commit",
+            "layout": "custom-header-printable-mask-8x5",
+            "source_payload_bytes": len(self.source_payload),
+            "payload_bytes": len(self.payload_template),
+            "git_object_bytes": len(self.object_template),
+            "padded_blocks": self.mutable_block + 1 + len(self.suffix_blocks),
+            "fixed_prefix_blocks": self.mutable_block,
+            "mutable_block": self.mutable_block,
+            "fixed_suffix_blocks": len(self.suffix_blocks),
+            "filler_bytes": self.filler_bytes,
+            "header_name": self.header_name.decode("ascii"),
+            "value_prefix_hex": self.value_prefix.hex(),
+            "nonce": {
+                "bytes": MASKED_NONCE_BYTES,
+                "candidate_bits": MASKED_NONCE_BITS,
+                "payload_offset": self.nonce_payload_offset,
+                "object_offset": self.nonce_object_offset,
+                "block_offset": MASKED_NONCE_BLOCK_OFFSET,
+                "first_word": 11,
+                "last_word": 12,
+                "mapping": "byte[i] = 0x20 | candidate[39-5*i:35-5*i]",
+                "alphabet": "0x20..0x3f",
+            },
+            "target": {
+                "bits": self.target.bits,
+                "hex": self.target.display_hex(),
+                "aligned_words": [f"{word:08x}" for word in self.target.words],
+                "word_masks": [f"{word:08x}" for word in self.target.masks],
+            },
+            "prestate": [f"{word:08x}" for word in self.prestate],
+            "base_words": [f"{word:08x}" for word in self.base_words],
+            "suffix_words": [
+                [f"{word:08x}" for word in words] for words in self.suffix_words
+            ],
+            "template_object_sha1": hashlib.sha1(self.object_template).hexdigest(),
+        }
+
+
 def build_raw_tail_job(
     payload: bytes,
     target: TargetPrefix,
@@ -693,6 +817,86 @@ def build_header_job(
             placeholder=placeholder,
         )
     raise RuntimeError(f"could not align custom-header nonce using fewer than {max_filler} filler bytes")
+
+
+def build_masked_header_job(
+    payload: bytes,
+    target: TargetPrefix,
+    *,
+    header_name: bytes = b"x",
+    value_prefix: bytes = b"",
+    filler_byte: bytes = b" ",
+    placeholder: bytes = b"PPPPPPPP",
+    max_filler: int = 4096,
+) -> MaskedHeaderJob:
+    """Insert an aligned eight-character, 40-bit printable custom header."""
+
+    source = bytes(payload)
+    separator = source.find(b"\n\n")
+    if separator < 0:
+        raise ValueError("commit payload must contain a blank line between headers and message")
+    if not header_name or any(byte <= 0x20 or byte >= 0x7F for byte in header_name):
+        raise ValueError("header name must be a non-empty printable ASCII token")
+    if b"\0" in value_prefix or b"\n" in value_prefix:
+        raise ValueError("header value prefix cannot contain NUL or newline")
+    if len(filler_byte) != 1 or filler_byte in (b"\0", b"\n"):
+        raise ValueError("filler byte must be one non-NUL, non-newline byte")
+    if len(placeholder) != MASKED_NONCE_BYTES:
+        raise ValueError("placeholder must contain exactly eight bytes")
+    if max_filler <= 0:
+        raise ValueError("max_filler must be positive")
+
+    headers = source[:separator]
+    message = source[separator + 2 :]
+    header_prefix = headers + b"\n" + header_name + b" " + value_prefix
+    for filler_bytes in range(max_filler):
+        nonce_payload_offset = len(header_prefix) + filler_bytes
+        candidate_payload = (
+            header_prefix
+            + filler_byte * filler_bytes
+            + placeholder
+            + b"\n\n"
+            + message
+        )
+        candidate_object = serialize_git_commit(candidate_payload)
+        object_header_bytes = len(candidate_object) - len(candidate_payload)
+        nonce_object_offset = object_header_bytes + nonce_payload_offset
+        if nonce_object_offset % 64 != MASKED_NONCE_BLOCK_OFFSET:
+            continue
+
+        padded = sha1_pad(candidate_object)
+        mutable_block = nonce_object_offset // 64
+        mutable_start = mutable_block * 64
+        suffix_start = mutable_start + 64
+        if suffix_start > len(padded):
+            continue
+        mutable_template = bytearray(padded[mutable_start:suffix_start])
+        mutable_template[
+            MASKED_NONCE_BLOCK_OFFSET : MASKED_NONCE_BLOCK_OFFSET + MASKED_NONCE_BYTES
+        ] = b"\0" * MASKED_NONCE_BYTES
+        suffix_blocks = tuple(
+            padded[offset : offset + 64] for offset in range(suffix_start, len(padded), 64)
+        )
+        return MaskedHeaderJob(
+            source_payload=source,
+            payload_template=candidate_payload,
+            object_template=candidate_object,
+            nonce_payload_offset=nonce_payload_offset,
+            nonce_object_offset=nonce_object_offset,
+            mutable_block=mutable_block,
+            filler_bytes=filler_bytes,
+            mutable_block_template=bytes(mutable_template),
+            suffix_blocks=suffix_blocks,
+            prestate=sha1_prestate(padded, mutable_block),
+            target=target,
+            header_name=header_name,
+            value_prefix=value_prefix,
+            filler_byte=filler_byte,
+            placeholder=placeholder,
+        )
+    raise RuntimeError(
+        f"could not align masked custom-header nonce using fewer than {max_filler} filler bytes"
+    )
 
 
 def _c_u32_array(name: str, words: Iterable[int]) -> str:

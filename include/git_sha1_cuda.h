@@ -111,6 +111,20 @@ GSV_API gsv_status gsv_context_set_nonce_policy(gsv_context *context,
                                                 gsv_nonce_policy policy);
 
 /*
+ * Configure an eight-character printable header job. base_words[11..12]
+ * contain zero placeholders. Candidate bits map to eight bytes as
+ * byte[i] = 0x20 | candidate[39-5*i:35-5*i].
+ */
+GSV_API gsv_status gsv_context_set_masked_header_job(
+    gsv_context *context,
+    const uint32_t prestate[5],
+    const uint32_t base_words[16],
+    uint32_t target_bits,
+    const uint32_t target_words[5],
+    const uint32_t *suffix_words,
+    uint32_t suffix_block_count);
+
+/*
  * Search outer_count W12 values beginning at outer_base. Each outer value
  * evaluates all 256 W13 high-byte values. Keep calls bounded (for example,
  * 2^22 outer values is about 0.1 seconds on an RTX 4060) for easy checkpointing.
@@ -120,10 +134,38 @@ GSV_API gsv_status gsv_search(gsv_context *context,
                               uint64_t outer_count,
                               gsv_search_result *result);
 
+/*
+ * Search the dense 95^5 printable-ASCII candidate domain. outer_base and
+ * outer_count address the 95^4 possible W12 values in base-95 order; each
+ * outer value evaluates W13 bytes 0x20..0x7e.
+ */
+GSV_API gsv_status gsv_search_printable(gsv_context *context,
+                                        uint64_t outer_base,
+                                        uint64_t outer_count,
+                                        gsv_search_result *result);
+
+/*
+ * Search a 32^5 printable subcube. Each byte is 0x20 | five_variable_bits;
+ * outer_base and outer_count address the 32^4 W12 values.
+ */
+GSV_API gsv_status gsv_search_printable_mask(gsv_context *context,
+                                             uint64_t outer_base,
+                                             uint64_t outer_count,
+                                             gsv_search_result *result);
+
+/* Search a configured eight-character masked-header job over 40-bit IDs. */
+GSV_API gsv_status gsv_search_masked_header(gsv_context *context,
+                                            uint64_t candidate_base,
+                                            uint64_t candidate_count,
+                                            gsv_search_result *result);
+
 /* Capture all five digest words for one candidate; intended for oracles/tests. */
 GSV_API gsv_status gsv_digest(gsv_context *context,
                               uint64_t candidate,
                               uint32_t digest_words[5]);
+GSV_API gsv_status gsv_digest_masked_header(gsv_context *context,
+                                            uint64_t candidate,
+                                            uint32_t digest_words[5]);
 
 GSV_API const char *gsv_last_error(const gsv_context *context);
 GSV_API const char *gsv_status_string(gsv_status status);
