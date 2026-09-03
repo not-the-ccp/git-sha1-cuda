@@ -1,183 +1,117 @@
 # git-sha1-cuda
 
-`git-sha1-cuda` is a CUDA implementation of SHA-1 prefix search for Git commit
-objects. It prepares complete commit objects in Rust or Python and evaluates a
-40-bit candidate space through a C ABI, with bounded launches for progress
-reporting and checkpointing.
+`git-sha1-cuda` creates unsigned Git commits with a chosen leading SHA-1
+prefix. Commit candidates are searched on an NVIDIA GPU, verified on the CPU,
+written to the object database, and installed as the repository's new `HEAD`.
 
-The production kernel supports:
+The project also provides the search engine as a C library and a safe Rust
+crate for applications that prepare their own commit objects.
 
-- SHA-1 target prefixes from 1 to 160 bits;
-- reusable CUDA contexts and runtime job changes;
-- exact five-word digest capture for candidate verification;
-- message-trailer and custom-header nonce carriers;
-- shared and static native libraries;
-- deterministic Git job generation with an independent CPU SHA-1 oracle.
+## Install
 
-## Search layouts
+The x86_64 Linux archive on the
+[releases page](https://github.com/not-the-ccp/git-sha1-cuda/releases) contains
+the CLI and its native library. Extract it and copy both directories into a
+prefix such as `/usr/local`:
 
-Each candidate is a five-byte big-endian value at byte offsets 48 through 52
-of a mutable SHA-1 block:
-
-```text
-candidate 0xAABBCCDDEE -> bytes AA BB CC DD EE
-
-final block W12        = 0xAABBCCDD
-final block W13[31:24] = 0xEE
+```bash
+tar -xf git-sha1-cuda-v0.1.0-x86_64-linux.tar.xz
+sudo cp -r git-sha1-cuda-v0.1.0-x86_64-linux/bin \
+  git-sha1-cuda-v0.1.0-x86_64-linux/lib /usr/local/
 ```
 
-All earlier Git object blocks are fixed and compressed once on the CPU. The
-resulting SHA-1 state becomes the GPU job's `prestate`. The mutable block stores
-zeroes in W12 and the high byte of W13 until a candidate is materialized.
+The release requires an x86_64 Linux system, an NVIDIA GPU, and a compatible
+NVIDIA driver.
 
-The kernel computes each W12-dependent message schedule once per lane pair.
-The pair evaluates all 256 W13 bytes using direct rotations and a 32 KiB table
-for multi-term schedule deltas.
+## Create a commit
 
-Two carriers use this layout:
+Stage the desired contents and run:
 
-| Carrier | Commit location | Ordinary Git/GitHub message view | SHA-1 work per candidate | RTX 4060 |
-|---|---|---|---:|---:|
-| Message trailer | Appended to the message | Visible in the full message | 1 block | 10.90 GH/s |
-| Custom header | Immediately before the header/message separator | Hidden from subject and body views | 2 blocks for a typical short message | 5.4 GH/s |
+```bash
+git add src/main.rs
+git-sha1-cuda commit --prefix 0000000 -m "Implement the parser"
+```
 
-The custom header remains visible in the raw commit object through commands
-such as `git cat-file commit`. Git preserves it as an ordinary unknown header,
-and `git fsck --strict` accepts the resulting object. Header candidates exclude
-NUL and LF bytes; trailer candidates exclude NUL bytes.
+`--prefix` accepts one to ten hexadecimal digits. Longer prefixes take
+exponentially more work. Multiple `-m` options create separate message
+paragraphs, and `--device N` selects a CUDA device.
 
-Winner publication has three selectable byte policies:
+The command uses:
 
-| Policy | Allowed candidate bytes | Eligible 5-byte candidates |
-|---|---|---:|
-| `NoNul` | Every byte except NUL | 98.06% |
-| `HeaderSafe` | Every byte except NUL and LF | 96.15% |
-| `PrintableAscii` | ASCII `0x20` through `0x7e` | 0.704% |
+- the tree represented by the current Git index;
+- the current `HEAD` as its single parent, when present;
+- author and committer identities resolved by `git var`;
+- the time at which the command starts;
+- the first available matching candidate from the GPU search.
 
-The policy changes which matching candidates are returned and does not change
-raw kernel throughput. Printable ASCII is useful when raw-object readability
-matters; an eight-digit target averages 56 seconds with the trailer layout or
-1 minute 53 seconds with a one-suffix-block header.
+The nonce is stored in a custom `x` commit header. It does not appear in the
+commit subject or body, although it remains available in the raw commit object
+shown by `git cat-file commit <id>`.
 
-## Performance
+Version 0.1 supports SHA-1 repositories, one-parent commits, `-m` messages, and
+the current index. Git commit hooks are outside this workflow. An unchanged
+index is rejected after the first commit.
 
-Measurements on an NVIDIA GeForce RTX 4060 with CUDA 13.3:
+## Search time
 
-| Target width | Throughput |
-|---|---:|
-| 1–32 bits | 10.95 GH/s |
-| 33–160 bits | 10.79 GH/s |
+Measurements on a GeForce RTX 4060 with CUDA 13.3 reached approximately
+5.4 billion candidates per second for the custom-header layout used by the
+CLI. Header-safe candidate filtering is included in the estimates below.
 
-The final-block kernel uses 96 registers, 33,280 bytes of dynamic shared
-memory, and no local memory or register spills. The benchmark uses
-billion-candidate launches after warm-up. Fixed suffix blocks add one SHA-1
-compression per block:
+| Leading hex digits | Average time | 95% complete by |
+|---:|---:|---:|
+| 6 | 3.2 ms | 9.5 ms |
+| 7 | 52 ms | 0.16 s |
+| 8 | 0.83 s | 2.5 s |
+| 9 | 13 s | 40 s |
+| 10 | 3 min 32 s | 10 min 36 s |
 
-| Fixed suffix blocks | Throughput |
-|---:|---:|
-| 0 | 10.7 GH/s |
-| 1 | 5.4 GH/s |
-| 2 | 3.6 GH/s |
-| 4 | 2.14 GH/s |
-| 8 | 1.18 GH/s |
+Search time follows a geometric distribution. The median is about 69% of the
+average, so individual runs vary considerably.
 
-### Expected search time
+The message-trailer layout available through the library searches about
+10.9 billion candidates per second because its mutable block is the final
+SHA-1 block. Its nonce is part of the commit message. The custom-header layout
+typically evaluates one additional fixed block per candidate to keep the nonce
+outside the message.
 
-The following averages use 10.95 GH/s for the message trailer and 5.4 GH/s
-for a custom header with one suffix block. They include each carrier's rejected
-candidate bytes.
-
-| Leading hex digits | Candidate bits | Message trailer | Custom header |
-|---:|---:|---:|---:|
-| 7 | 28 | 25 ms | 52 ms |
-| 8 | 32 | 0.40 s | 0.83 s |
-| 9 | 36 | 6.4 s | 13.2 s |
-| 10 | 40 | 1 min 42 s | 3 min 32 s |
-| 11 | 44 | 27 min 18 s | 56 min 28 s |
-| 12 | 48 | 7 h 17 min | 15 h 03 min |
-
-A single job contains 40 candidate bits. Searches wider than ten hexadecimal
-digits require fresh templates carrying additional fixed epoch bits. The table
-assumes epochs continue until a match is found. Search time follows a geometric
-distribution: 50% of searches finish within 0.693 times the average and 95%
-within 3.00 times the average.
-
-`GitJob::header_epoch` encodes a fixed epoch before the candidate while keeping
-the custom-header layout aligned. Applications can reuse a CUDA context across
-epochs with `GitJob::configure_context_with_policy`.
-
-Reproducible benchmark generators, resource reports, correctness captures,
-and SASS summaries are available in [`experiments/shared`](experiments/shared).
-Custom-header measurements and reproduction commands are in
-[`experiments/header`](experiments/header).
-
-## Build
+## Build from source
 
 Requirements:
 
 - CUDA Toolkit 12 or newer;
 - CMake 3.24 or newer;
-- a C++17 compiler supported by the installed CUDA Toolkit.
+- Rust 1.82 or newer;
+- Git.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
+
+GSV_LIB_DIR="$PWD/build" \
+  cargo build --release --manifest-path rust/git-sha1-cuda/Cargo.toml
 ```
 
-The build produces:
+The CLI binary is written to
+`rust/git-sha1-cuda/target/release/git-sha1-cuda`. The native build produces
+`build/libgit_sha1_cuda.so` and `build/libgit_sha1_cuda_static.a`.
 
-```text
-build/libgit_sha1_cuda.so
-build/libgit_sha1_cuda_static.a
-```
-
-CMake targets the local GPU architecture by default. Cross-builds can set it
-explicitly, for example:
+CMake targets the local GPU architecture by default. Set
+`CMAKE_CUDA_ARCHITECTURES` for a distributable or cross-compiled build:
 
 ```bash
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=89
+  -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89"
 ```
 
-## C API
+## Rust API
 
-The public ABI is declared in
-[`include/git_sha1_cuda.h`](include/git_sha1_cuda.h).
-
-| Function | Purpose |
-|---|---|
-| `gsv_job_init` | Validate a mutable block and derive masks and round-12 state |
-| `gsv_context_create` | Allocate device tables, events, and result buffers |
-| `gsv_context_set_job` | Reuse a context with another job |
-| `gsv_context_set_header_job` | Configure a mutable block followed by fixed suffix blocks |
-| `gsv_context_set_nonce_policy` | Select NUL-free, header-safe, or printable winners |
-| `gsv_search` | Search `outer_count * 256` candidates from `outer_base << 8` |
-| `gsv_digest` | Compute the complete SHA-1 digest for one candidate |
-| `gsv_context_destroy` | Release context resources |
-
-`gsv_search` reports the number of evaluated candidates, CUDA event time, and
-throughput. Winner selection uses a device atomic and may return any matching
-candidate in the requested batch.
-
-An outer count of `2^22` evaluates 1,073,741,824 candidates in about 0.10
-seconds on the measured RTX 4060. Applications can choose batch sizes around
-their desired cancellation and checkpoint latency.
-
-## Rust
-
-The crate under [`rust/git-sha1-cuda`](rust/git-sha1-cuda) provides
-dependency-free preparation, CPU verification, and safe CUDA bindings.
-
-```toml
-[dependencies]
-git-sha1-cuda = { path = "../git-sha1-cuda/rust/git-sha1-cuda" }
-```
-
-The build script searches for the native library in the repository's `build`
-directory. `GSV_LIB_DIR` selects a different directory. The platform's dynamic
-loader must also be able to locate `libgit_sha1_cuda.so` at runtime.
+The dependency-free crate under
+[`rust/git-sha1-cuda`](rust/git-sha1-cuda) prepares complete Git commit jobs,
+verifies results with an independent SHA-1 implementation, and exposes the
+CUDA context through safe Rust types.
 
 ```rust,no_run
 use git_sha1_cuda::{GitJob, TargetPrefix};
@@ -190,10 +124,9 @@ let mut context = prepared.create_context(0)?;
 for outer_base in (0..1_u64 << 32).step_by(1 << 22) {
     let result = context.search(outer_base, 1 << 22)?;
     if let Some(candidate) = result.candidate {
-        let digest = prepared.verify_candidate(candidate)?;
-        let finished_payload = prepared.materialize_payload(candidate)?;
-        println!("candidate={candidate:010x} digest={digest:02x?}");
-        std::fs::write("commit-payload.bin", finished_payload)?;
+        prepared.verify_candidate(candidate)?;
+        let payload = prepared.materialize_payload(candidate)?;
+        std::fs::write("commit-payload.bin", payload)?;
         break;
     }
 }
@@ -201,10 +134,22 @@ for outer_base in (0..1_u64 << 32).step_by(1 << 22) {
 # }
 ```
 
-## Git job generation
+`GSV_LIB_DIR` selects the directory containing `libgit_sha1_cuda.so` while
+building the crate.
 
-[`tools/git_sha1_job.py`](tools/git_sha1_job.py) builds the aligned commit job
-and verifies Git object serialization independently of the CUDA code.
+## C API
+
+[`include/git_sha1_cuda.h`](include/git_sha1_cuda.h) declares the stable C ABI.
+Its reusable contexts support target prefixes from 1 to 160 bits, bounded
+search batches, full digest capture, runtime job replacement, custom-header
+suffix blocks, and selectable nonce-byte policies.
+
+An outer batch of `2^22` covers 1,073,741,824 candidates. This takes about
+0.20 seconds for a typical custom-header job on the measured RTX 4060, keeping
+launch and transfer overhead small while allowing regular progress updates.
+
+The Python job generator provides an independent preparation and verification
+path:
 
 ```bash
 python3 tools/git_sha1_job.py commit-payload.bin \
@@ -213,36 +158,8 @@ python3 tools/git_sha1_job.py commit-payload.bin \
   --output job
 ```
 
-The output directory contains:
-
-| File | Contents |
-|---|---|
-| `job.json` | Layout, target, prestate, masks, and candidate offsets |
-| `payload-template.bin` | Commit payload with the five-byte placeholder |
-| `object-template.bin` | Serialized Git object template |
-| `mutable-block-template.bin` | Padded block containing the custom-header nonce |
-| `suffix-blocks.bin` | Fixed padded blocks following the mutable block |
-
-After a successful search, the five-byte big-endian candidate replaces the
-placeholder. The CPU oracle hashes the complete serialized object and checks
-the requested prefix before the object is stored.
-
-## Correctness
-
-The test suite covers:
-
-- Git object framing against `git hash-object`;
-- independent SHA-1 compression across padding boundaries;
-- exact GPU/CPU digest agreement;
-- target masks and gates from 1 through 160 bits;
-- candidate byte order and W12/W13 mapping;
-- C ABI search and digest capture on a CUDA device.
-
-Run the host tests directly with:
-
-```bash
-python3 -m unittest -v
-```
+Benchmark generators and captured results are stored under
+[`experiments`](experiments).
 
 ## License
 

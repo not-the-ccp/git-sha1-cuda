@@ -2,8 +2,9 @@
 name = "git-sha1-cuda"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
 links = "git_sha1_cuda"
-description = "Dependency-free Git commit preparation and safe bindings for the git_sha1_cuda backend"
+description = "CUDA vanity commit CLI, Git commit preparation, and safe native bindings"
 publish = false
 license = "MPL-2.0"
 

@@ -14,4 +14,7 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", fallback.display());
     }
     println!("cargo:rustc-link-lib=dylib=git_sha1_cuda");
+    if env::var_os("CARGO_CFG_TARGET_OS").as_deref() == Some(std::ffi::OsStr::new("linux")) {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
+    }
 }
