@@ -161,6 +161,15 @@ ctest --test-dir build --output-on-failure
 This produces `build/libgit_sha1_cuda.so` and
 `build/libgit_sha1_cuda_static.a`.
 
+Install the C header, libraries, and CMake package metadata with:
+
+```bash
+cmake --install build --prefix /usr/local
+```
+
+CMake consumers can then link `git_sha1_cuda::git_sha1_cuda` after calling
+`find_package(git_sha1_cuda CONFIG REQUIRED)`.
+
 CMake targets the local GPU architecture by default. Set
 `CMAKE_CUDA_ARCHITECTURES` for a distributable or cross-compiled build:
 

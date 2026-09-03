@@ -23,7 +23,10 @@ set_target_properties(git_sha1_cuda PROPERTIES
 option(GSV_BUILD_STATIC "Build libgit_sha1_cuda_static.a" ON)
 if(GSV_BUILD_STATIC)
   add_library(git_sha1_cuda_static STATIC ${GSV_SOURCE})
-  target_include_directories(git_sha1_cuda_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_include_directories(git_sha1_cuda_static
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:include>)
   target_compile_features(git_sha1_cuda_static PUBLIC cxx_std_17 cuda_std_17)
   target_compile_options(git_sha1_cuda_static PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)
   set_target_properties(git_sha1_cuda_static PROPERTIES
@@ -33,9 +36,34 @@ endif()
 
 include(GNUInstallDirs)
 install(TARGETS git_sha1_cuda
+  EXPORT git_sha1_cudaTargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(GSV_BUILD_STATIC)
+  install(TARGETS git_sha1_cuda_static
+    EXPORT git_sha1_cudaTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 install(FILES include/git_sha1_cuda.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+  cmake/git_sha1_cudaConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/git_sha1_cudaConfig.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/git_sha1_cuda)
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/git_sha1_cudaConfigVersion.cmake
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion)
+install(EXPORT git_sha1_cudaTargets
+  FILE git_sha1_cudaTargets.cmake
+  NAMESPACE git_sha1_cuda::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/git_sha1_cuda)
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/git_sha1_cudaConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/git_sha1_cudaConfigVersion.cmake
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/git_sha1_cuda)
 
 include(CTest)
 if(BUILD_TESTING)
