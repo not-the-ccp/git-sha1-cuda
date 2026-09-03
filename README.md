@@ -88,10 +88,22 @@ git-sha1-cuda commit --prefix 0000000 -m "Import the archive" \
 During `--amend`, `--author` and `--date` replace their respective original
 fields. `--reset-author` replaces both with the current Git author and time.
 
+Complete a merge after staging its result with the same commit command:
+
+```bash
+git merge --no-commit topic
+git-sha1-cuda commit --prefix 0000000 -m "Merge topic"
+```
+
+Every commit listed in `MERGE_HEAD` becomes a parent after the current `HEAD`.
+Merge metadata is cleared after the new commit is installed successfully.
+`--no-update-ref` leaves the repository's merge state intact. Merge autostash
+state must be resolved before running the command.
+
 The command uses:
 
 - the tree represented by the current Git index;
-- the current `HEAD` as its single parent, when present;
+- the current `HEAD` and active merge heads as parents, when present;
 - author and committer identities resolved through Git, with optional author overrides;
 - the time at which the command starts;
 - the first available matching candidate from the GPU search.
@@ -100,9 +112,10 @@ The default nonce is eight printable characters stored in a custom `x` commit
 header. It does not appear in the commit subject or body, although it remains
 available in the raw commit object shown by `git cat-file commit <id>`.
 
-Version 0.3 supports SHA-1 repositories, one-parent commits, `-m` messages, and
-the current index. Git commit hooks are outside this workflow. An unchanged
-index is rejected after the first commit.
+The CLI supports SHA-1 repositories, root commits, ordinary commits, merge
+commits, amendments, `-m` messages, and the current index. Git commit hooks are
+outside this workflow. An unchanged index is accepted for merges and rejected
+for ordinary commits unless `--allow-empty` is used.
 
 The CLI automatically starts a fresh nonce epoch when a complete 40-bit domain
 contains no eligible match. Progress reports show the probability that a match

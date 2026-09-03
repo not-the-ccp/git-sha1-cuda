@@ -40,6 +40,12 @@ struct CommitArgs {
     resume: Option<String>,
 }
 
+struct CommitPayload {
+    bytes: Vec<u8>,
+    expected_head: Option<String>,
+    merging: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommitCarrier {
     Header,
@@ -598,6 +604,48 @@ fn git_input(arguments: &[&str], input: &[u8]) -> Result<String, Box<dyn Error>>
     Ok(String::from_utf8(output.stdout)?.trim_end().to_owned())
 }
 
+fn git_path(name: &str) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    Ok(git_output(&["rev-parse", "--git-path", name])?.into())
+}
+
+fn merge_heads() -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let path = git_path("MERGE_HEAD")?;
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut heads = Vec::new();
+    for line in contents.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() != 40 || !line.iter().all(u8::is_ascii_hexdigit) {
+            return Err("MERGE_HEAD contains an invalid object ID".into());
+        }
+        let id = String::from_utf8(line.to_vec())?;
+        let commit = format!("{id}^{{commit}}");
+        git_output(&["rev-parse", "--verify", &commit])?;
+        heads.push(line.to_vec());
+    }
+    if heads.is_empty() {
+        return Err("MERGE_HEAD contains no commit IDs".into());
+    }
+    Ok(heads)
+}
+
+fn clear_merge_state() -> Result<(), Box<dyn Error>> {
+    for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "MERGE_RR"] {
+        match fs::remove_file(git_path(name)?) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not remove {name}: {error}").into()),
+        }
+    }
+    git_output(&["update-ref", "-d", "AUTO_MERGE"])?;
+    Ok(())
+}
+
 fn commit_payload(
     message: &[u8],
     allow_empty: bool,
@@ -606,7 +654,7 @@ fn commit_payload(
     author_date: Option<&str>,
     reset_author: bool,
     committer_date: Option<&str>,
-) -> Result<(Vec<u8>, Option<String>), Box<dyn Error>> {
+) -> Result<CommitPayload, Box<dyn Error>> {
     git_output(&["rev-parse", "--git-dir"])?;
     let format = git_output(&["rev-parse", "--show-object-format"])?;
     if format != "sha1" {
@@ -615,10 +663,18 @@ fn commit_payload(
 
     let tree = git_output(&["write-tree"])?;
     let head = git_optional(&["rev-parse", "--verify", "HEAD"])?;
+    let merge_heads = if amend { Vec::new() } else { merge_heads()? };
+    let merging = !merge_heads.is_empty();
+    if merging && head.is_none() {
+        return Err("MERGE_HEAD exists in a repository without HEAD".into());
+    }
+    if merging && git_path("MERGE_AUTOSTASH")?.try_exists()? {
+        return Err("merge commits with MERGE_AUTOSTASH are not supported yet".into());
+    }
     if amend && head.is_none() {
         return Err("--amend requires an existing HEAD commit".into());
     }
-    if !allow_empty && !amend {
+    if !allow_empty && !amend && !merging {
         if let Some(head_id) = &head {
             let parent_tree = git_output(&["show", "-s", "--format=%T", head_id])?;
             if parent_tree == tree {
@@ -626,7 +682,7 @@ fn commit_payload(
             }
         }
     }
-    let (author, parents) = if amend {
+    let (author, mut parents) = if amend {
         let old_payload = git_bytes(&["cat-file", "commit", head.as_ref().unwrap()])?;
         let old_headers = old_payload
             .windows(2)
@@ -653,6 +709,7 @@ fn commit_payload(
                 .collect(),
         )
     };
+    parents.extend(merge_heads);
     let committer = current_committer_ident(committer_date)?;
     let mut payload = format!("tree {tree}\n").into_bytes();
     for parent_id in parents {
@@ -669,7 +726,11 @@ fn commit_payload(
     if !payload.ends_with(b"\n") {
         payload.push(b'\n');
     }
-    Ok((payload, head))
+    Ok(CommitPayload {
+        bytes: payload,
+        expected_head: head,
+        merging,
+    })
 }
 
 fn hex_digest(digest: &[u8; 20]) -> String {
@@ -844,7 +905,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             Some(point.author_date.as_str())
         });
     let committer_date = resume.as_ref().map(|point| point.committer_date.as_str());
-    let (payload, parent) = commit_payload(
+    let CommitPayload {
+        bytes: payload,
+        expected_head: parent,
+        merging,
+    } = commit_payload(
         &message,
         args.allow_empty,
         args.amend,
@@ -953,6 +1018,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         let old_id =
             parent.unwrap_or_else(|| "0000000000000000000000000000000000000000".to_owned());
         git_output(&["update-ref", "-m", &reflog, "HEAD", &object_id, &old_id])?;
+        if merging {
+            clear_merge_state()?;
+        }
     }
     eprintln!(
         "Found in {:.2?} after {} candidates ({:.2} GH/s)",
