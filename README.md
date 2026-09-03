@@ -15,9 +15,9 @@ the CLI and its native library. Extract it and copy both directories into a
 prefix such as `/usr/local`:
 
 ```bash
-tar -xf git-sha1-cuda-v0.2.0-x86_64-linux.tar.xz
-sudo cp -r git-sha1-cuda-v0.2.0-x86_64-linux/bin \
-  git-sha1-cuda-v0.2.0-x86_64-linux/lib /usr/local/
+tar -xf git-sha1-cuda-v0.3.0-x86_64-linux.tar.xz
+sudo cp -r git-sha1-cuda-v0.3.0-x86_64-linux/bin \
+  git-sha1-cuda-v0.3.0-x86_64-linux/lib /usr/local/
 ```
 
 The release requires an x86_64 Linux system, an NVIDIA GPU, and a compatible
@@ -78,7 +78,7 @@ The default nonce is eight printable characters stored in a custom `x` commit
 header. It does not appear in the commit subject or body, although it remains
 available in the raw commit object shown by `git cat-file commit <id>`.
 
-Version 0.2 supports SHA-1 repositories, one-parent commits, `-m` messages, and
+Version 0.3 supports SHA-1 repositories, one-parent commits, `-m` messages, and
 the current index. Git commit hooks are outside this workflow. An unchanged
 index is rejected after the first commit.
 
