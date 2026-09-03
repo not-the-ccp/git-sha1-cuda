@@ -23,6 +23,7 @@ struct CommitArgs {
     carrier: CommitCarrier,
     update_ref: bool,
     allow_empty: bool,
+    amend: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -119,6 +120,7 @@ OPTIONS:
         --device N       CUDA device index [default: 0]
         --no-update-ref  Write the commit object without advancing HEAD
         --allow-empty    Create a commit when the index tree is unchanged
+        --amend          Replace HEAD while preserving its author and parents
     -h, --help           Print help
     -V, --version        Print version
 "#
@@ -147,6 +149,7 @@ fn parse_args() -> Result<CommitArgs, String> {
     let mut carrier = CommitCarrier::Header;
     let mut update_ref = true;
     let mut allow_empty = false;
+    let mut amend = false;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-p" | "--prefix") => {
@@ -170,6 +173,7 @@ fn parse_args() -> Result<CommitArgs, String> {
             }
             Some("--no-update-ref") => update_ref = false,
             Some("--allow-empty") => allow_empty = true,
+            Some("--amend") => amend = true,
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 std::process::exit(0);
@@ -200,6 +204,7 @@ fn parse_args() -> Result<CommitArgs, String> {
         carrier,
         update_ref,
         allow_empty,
+        amend,
     })
 }
 
@@ -236,13 +241,19 @@ fn value(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<Stri
         .map_err(|_| format!("{option} must be valid UTF-8"))
 }
 
-fn git_output(arguments: &[&str]) -> Result<String, Box<dyn Error>> {
+fn git_bytes(arguments: &[&str]) -> Result<Vec<u8>, Box<dyn Error>> {
     let output = Command::new("git").args(arguments).output()?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git {} failed: {}", arguments.join(" "), detail.trim()).into());
     }
-    Ok(String::from_utf8(output.stdout)?.trim_end().to_owned())
+    Ok(output.stdout)
+}
+
+fn git_output(arguments: &[&str]) -> Result<String, Box<dyn Error>> {
+    Ok(String::from_utf8(git_bytes(arguments)?)?
+        .trim_end()
+        .to_owned())
 }
 
 fn git_optional(arguments: &[&str]) -> Result<Option<String>, Box<dyn Error>> {
@@ -275,6 +286,7 @@ fn git_input(arguments: &[&str], input: &[u8]) -> Result<String, Box<dyn Error>>
 fn commit_payload(
     message: &[u8],
     allow_empty: bool,
+    amend: bool,
 ) -> Result<(Vec<u8>, Option<String>), Box<dyn Error>> {
     git_output(&["rev-parse", "--git-dir"])?;
     let format = git_output(&["rev-parse", "--show-object-format"])?;
@@ -283,27 +295,57 @@ fn commit_payload(
     }
 
     let tree = git_output(&["write-tree"])?;
-    let parent = git_optional(&["rev-parse", "--verify", "HEAD"])?;
-    if !allow_empty {
-        if let Some(parent_id) = &parent {
-            let parent_tree = git_output(&["show", "-s", "--format=%T", parent_id])?;
+    let head = git_optional(&["rev-parse", "--verify", "HEAD"])?;
+    if amend && head.is_none() {
+        return Err("--amend requires an existing HEAD commit".into());
+    }
+    if !allow_empty && !amend {
+        if let Some(head_id) = &head {
+            let parent_tree = git_output(&["show", "-s", "--format=%T", head_id])?;
             if parent_tree == tree {
                 return Err("the index has no changes to commit".into());
             }
         }
     }
-    let author = git_output(&["var", "GIT_AUTHOR_IDENT"])?;
+    let (author, parents) = if amend {
+        let old_payload = git_bytes(&["cat-file", "commit", head.as_ref().unwrap()])?;
+        let old_headers = old_payload
+            .windows(2)
+            .position(|bytes| bytes == b"\n\n")
+            .map_or(old_payload.as_slice(), |offset| &old_payload[..offset]);
+        let author = old_headers
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(b"author "))
+            .ok_or("HEAD commit has no author header")?
+            .to_vec();
+        let parents = old_headers
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.strip_prefix(b"parent ").map(|parent| parent.to_vec()))
+            .collect::<Vec<_>>();
+        (author, parents)
+    } else {
+        (
+            git_output(&["var", "GIT_AUTHOR_IDENT"])?.into_bytes(),
+            head.iter()
+                .map(|parent| parent.as_bytes().to_vec())
+                .collect(),
+        )
+    };
     let committer = git_output(&["var", "GIT_COMMITTER_IDENT"])?;
     let mut payload = format!("tree {tree}\n").into_bytes();
-    if let Some(parent_id) = &parent {
-        payload.extend_from_slice(format!("parent {parent_id}\n").as_bytes());
+    for parent_id in parents {
+        payload.extend_from_slice(b"parent ");
+        payload.extend_from_slice(&parent_id);
+        payload.push(b'\n');
     }
-    payload.extend_from_slice(format!("author {author}\ncommitter {committer}\n\n").as_bytes());
+    payload.extend_from_slice(b"author ");
+    payload.extend_from_slice(&author);
+    payload.extend_from_slice(format!("\ncommitter {committer}\n\n").as_bytes());
     payload.extend_from_slice(message);
     if !payload.ends_with(b"\n") {
         payload.push(b'\n');
     }
-    Ok((payload, parent))
+    Ok((payload, head))
 }
 
 fn hex_digest(digest: &[u8; 20]) -> String {
@@ -338,7 +380,7 @@ fn prepare_job(
 fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args().map_err(|message| format!("{message}\n\n{}", usage()))?;
     let message = read_message(&args)?;
-    let (payload, parent) = commit_payload(&message, args.allow_empty)?;
+    let (payload, parent) = commit_payload(&message, args.allow_empty, args.amend)?;
     let target = TargetPrefix::from_hex(&args.prefix)?;
     let mut epoch = 0_u64;
     let mut job = prepare_job(&payload, target, args.carrier, epoch)?;

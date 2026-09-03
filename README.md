@@ -54,6 +54,11 @@ printf 'Automated commit\n' | git-sha1-cuda commit --prefix 0000000 -F -
 ```
 
 `--allow-empty` permits a commit when the index has the same tree as `HEAD`.
+`--amend` replaces `HEAD` while preserving its author and parent set:
+
+```bash
+git-sha1-cuda commit --amend --prefix 0000000 -m "Revised message"
+```
 
 The command uses:
 
