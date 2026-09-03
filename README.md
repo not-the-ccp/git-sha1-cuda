@@ -15,9 +15,9 @@ the CLI and its native library. Extract it and copy both directories into a
 prefix such as `/usr/local`:
 
 ```bash
-tar -xf git-sha1-cuda-v0.3.0-x86_64-linux.tar.xz
-sudo cp -r git-sha1-cuda-v0.3.0-x86_64-linux/bin \
-  git-sha1-cuda-v0.3.0-x86_64-linux/lib /usr/local/
+tar -xf git-sha1-cuda-v0.4.0-x86_64-linux.tar.xz
+sudo cp -r git-sha1-cuda-v0.4.0-x86_64-linux/bin \
+  git-sha1-cuda-v0.4.0-x86_64-linux/lib /usr/local/
 ```
 
 The release requires an x86_64 Linux system, an NVIDIA GPU, and a compatible
@@ -281,6 +281,24 @@ python3 tools/git_sha1_job.py commit-payload.bin \
 
 Benchmark generators and captured results are stored under
 [`experiments`](experiments).
+
+## Release package
+
+Build the x86_64 CUDA Linux archive and its checksum with:
+
+```bash
+scripts/package-linux-release.sh
+```
+
+The container build uses CUDA 12.4, Ubuntu 22.04, CMake 3.31.6, Rust 1.82.0,
+and CUDA architectures 7.5, 8.0, 8.6, and 8.9. Archive ownership, ordering,
+and timestamps are normalized for reproducible output.
+
+Run the packaged CLI against a CUDA device with:
+
+```bash
+scripts/smoke-linux-release.sh dist/git-sha1-cuda-v0.4.0-x86_64-linux.tar.xz
+```
 
 ## License
 

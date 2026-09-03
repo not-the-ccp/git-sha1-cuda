@@ -1,0 +1,46 @@
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:da6791294b0b04d7e65d87b7451d6f2390b4d36225ab0701ee7dfec5769829f5 AS builder
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG GSV_VERSION
+ARG SOURCE_DATE_EPOCH
+ARG CMAKE_VERSION=3.31.6
+ARG RUST_VERSION=1.82.0
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       build-essential ca-certificates curl git python3-pip xz-utils \
+    && pip3 install --no-cache-dir "cmake==${CMAKE_VERSION}" \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+       | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/root/.cargo/bin:${PATH}
+WORKDIR /source
+COPY . .
+
+RUN test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' rust/git-sha1-cuda/Cargo.toml | head -1)" = "${GSV_VERSION}" \
+    && cmake -S . -B /build/native \
+       -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_CUDA_ARCHITECTURES='75;80;86;89' \
+       -DBUILD_TESTING=OFF \
+       -DGSV_BUILD_STATIC=OFF \
+       -DCMAKE_INSTALL_PREFIX=/stage \
+    && cmake --build /build/native -j \
+    && cmake --install /build/native \
+    && GSV_LIB_DIR=/stage/lib cargo build --release --locked \
+       --manifest-path rust/git-sha1-cuda/Cargo.toml
+
+RUN package="git-sha1-cuda-v${GSV_VERSION}-x86_64-linux" \
+    && mkdir -p "/output/${package}/bin" \
+    && cp rust/git-sha1-cuda/target/release/git-sha1-cuda "/output/${package}/bin/" \
+    && cp -a /stage/include /stage/lib "/output/${package}/" \
+    && cp README.md LICENSE "/output/${package}/" \
+    && tar -C /output --sort=name --mtime="@${SOURCE_DATE_EPOCH}" \
+       --owner=0 --group=0 --numeric-owner -cJf "/output/${package}.tar.xz" "${package}" \
+    && cd /output \
+    && sha256sum "${package}.tar.xz" > "${package}.tar.xz.sha256"
+
+FROM scratch
+COPY --from=builder /output/*.tar.xz /
+COPY --from=builder /output/*.sha256 /

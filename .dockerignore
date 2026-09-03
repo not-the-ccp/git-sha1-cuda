@@ -1,0 +1,5 @@
+.git
+build
+dist
+rust/git-sha1-cuda/target
+sha1-git-vanity-research-current.tar.xz
