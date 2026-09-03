@@ -5,7 +5,7 @@ use std::{error::Error, ffi::CStr, fmt, os::raw::c_char, ptr};
 mod git;
 mod sha1;
 
-pub use git::{Carrier, GitJob, PreparationError, TargetPrefix};
+pub use git::{Carrier, GitJob, PreparationError, PrintableHeaderJob, TargetPrefix};
 
 const OK: i32 = 0;
 const FOUND: i32 = 1;
@@ -72,6 +72,15 @@ unsafe extern "C" {
         suffix_block_count: u32,
     ) -> i32;
     fn gsv_context_set_nonce_policy(context: *mut RawContext, policy: i32) -> i32;
+    fn gsv_context_set_masked_header_job(
+        context: *mut RawContext,
+        prestate: *const u32,
+        base_words: *const u32,
+        target_bits: u32,
+        target_words: *const u32,
+        suffix_words: *const u32,
+        suffix_block_count: u32,
+    ) -> i32;
     fn gsv_search(
         context: *mut RawContext,
         outer_base: u64,
@@ -79,6 +88,13 @@ unsafe extern "C" {
         result: *mut RawSearchResult,
     ) -> i32;
     fn gsv_digest(context: *mut RawContext, candidate: u64, digest: *mut u32) -> i32;
+    fn gsv_search_masked_header(
+        context: *mut RawContext,
+        candidate_base: u64,
+        candidate_count: u64,
+        result: *mut RawSearchResult,
+    ) -> i32;
+    fn gsv_digest_masked_header(context: *mut RawContext, candidate: u64, digest: *mut u32) -> i32;
     fn gsv_last_error(context: *const RawContext) -> *const c_char;
     fn gsv_status_string(status: i32) -> *const c_char;
 }
@@ -237,6 +253,41 @@ impl Context {
         }
     }
 
+    pub fn set_masked_header_job(
+        &mut self,
+        prestate: &[u32; 5],
+        base_words: &[u32; 16],
+        target_bits: u32,
+        target_words: &[u32; 5],
+        suffix_blocks: &[[u32; 16]],
+    ) -> Result<(), CudaError> {
+        let suffix_block_count = u32::try_from(suffix_blocks.len()).map_err(|_| CudaError {
+            status: -1,
+            message: "suffix block count exceeds the C ABI limit".to_owned(),
+        })?;
+        let suffix_words = if suffix_blocks.is_empty() {
+            ptr::null()
+        } else {
+            suffix_blocks.as_ptr().cast::<u32>()
+        };
+        let status = unsafe {
+            gsv_context_set_masked_header_job(
+                self.raw,
+                prestate.as_ptr(),
+                base_words.as_ptr(),
+                target_bits,
+                target_words.as_ptr(),
+                suffix_words,
+                suffix_block_count,
+            )
+        };
+        if status == OK {
+            Ok(())
+        } else {
+            Err(error(status, self.raw))
+        }
+    }
+
     /// Searches `outer_count * 256` candidates, starting at `outer_base << 8`.
     pub fn search(&mut self, outer_base: u64, outer_count: u64) -> Result<SearchResult, CudaError> {
         let mut raw = RawSearchResult::default();
@@ -255,6 +306,36 @@ impl Context {
     pub fn digest(&mut self, candidate: u64) -> Result<[u32; 5], CudaError> {
         let mut digest = [0; 5];
         let status = unsafe { gsv_digest(self.raw, candidate, digest.as_mut_ptr()) };
+        if status == OK {
+            Ok(digest)
+        } else {
+            Err(error(status, self.raw))
+        }
+    }
+
+    pub fn search_masked_header(
+        &mut self,
+        candidate_base: u64,
+        candidate_count: u64,
+    ) -> Result<SearchResult, CudaError> {
+        let mut raw = RawSearchResult::default();
+        let status = unsafe {
+            gsv_search_masked_header(self.raw, candidate_base, candidate_count, &mut raw)
+        };
+        if status != FOUND && status != NOT_FOUND {
+            return Err(error(status, self.raw));
+        }
+        Ok(SearchResult {
+            candidate: (raw.found != 0 && raw.candidate != NO_WINNER).then_some(raw.candidate),
+            candidates_hashed: raw.candidates_hashed,
+            milliseconds: raw.milliseconds,
+            billions_per_second: raw.billions_per_second,
+        })
+    }
+
+    pub fn digest_masked_header(&mut self, candidate: u64) -> Result<[u32; 5], CudaError> {
+        let mut digest = [0; 5];
+        let status = unsafe { gsv_digest_masked_header(self.raw, candidate, digest.as_mut_ptr()) };
         if status == OK {
             Ok(digest)
         } else {

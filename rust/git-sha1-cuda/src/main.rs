@@ -8,10 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use git_sha1_cuda::{GitJob, TargetPrefix};
+use git_sha1_cuda::{Context, GitJob, PrintableHeaderJob, SearchResult, TargetPrefix};
 
-const DEFAULT_OUTER_BATCH: u64 = 1 << 22;
-const OUTER_DOMAIN: u64 = 1 << 32;
+const RAW_OUTER_BATCH: u64 = 1 << 22;
+const RAW_OUTER_DOMAIN: u64 = 1 << 32;
+const PRINTABLE_BATCH: u64 = 1 << 30;
+const PRINTABLE_DOMAIN: u64 = 1 << 40;
 
 struct CommitArgs {
     prefix: String,
@@ -31,9 +33,73 @@ enum CommitCarrier {
 impl CommitCarrier {
     fn eligible_fraction(self) -> f64 {
         match self {
-            Self::Header => (254.0_f64 / 256.0).powi(5),
+            Self::Header => 1.0,
             Self::Trailer => (255.0_f64 / 256.0).powi(5),
         }
+    }
+}
+
+enum PreparedJob {
+    Printable(PrintableHeaderJob),
+    Raw(GitJob),
+}
+
+impl PreparedJob {
+    fn create_context(&self, device: i32) -> Result<Context, Box<dyn Error>> {
+        Ok(match self {
+            Self::Printable(job) => job.create_context(device)?,
+            Self::Raw(job) => job.create_context(device)?,
+        })
+    }
+
+    fn configure_context(&self, context: &mut Context) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::Printable(job) => job.configure_context(context)?,
+            Self::Raw(job) => {
+                job.configure_context_with_policy(context, git_sha1_cuda::NoncePolicy::NoNul)?
+            }
+        }
+        Ok(())
+    }
+
+    fn batch_size(&self) -> u64 {
+        match self {
+            Self::Printable(_) => PRINTABLE_BATCH,
+            Self::Raw(_) => RAW_OUTER_BATCH,
+        }
+    }
+
+    fn domain_size(&self) -> u64 {
+        match self {
+            Self::Printable(_) => PRINTABLE_DOMAIN,
+            Self::Raw(_) => RAW_OUTER_DOMAIN,
+        }
+    }
+
+    fn search(
+        &self,
+        context: &mut Context,
+        base: u64,
+        count: u64,
+    ) -> Result<SearchResult, Box<dyn Error>> {
+        Ok(match self {
+            Self::Printable(_) => context.search_masked_header(base, count)?,
+            Self::Raw(_) => context.search(base, count)?,
+        })
+    }
+
+    fn verify_candidate(&self, candidate: u64) -> Result<[u8; 20], Box<dyn Error>> {
+        Ok(match self {
+            Self::Printable(job) => job.verify_candidate(candidate)?,
+            Self::Raw(job) => job.verify_candidate(candidate)?,
+        })
+    }
+
+    fn materialize_payload(&self, candidate: u64) -> Result<Vec<u8>, Box<dyn Error>> {
+        Ok(match self {
+            Self::Printable(job) => job.materialize_payload(candidate)?,
+            Self::Raw(job) => job.materialize_payload(candidate)?,
+        })
     }
 }
 
@@ -244,12 +310,18 @@ fn prepare_job(
     target: TargetPrefix,
     carrier: CommitCarrier,
     epoch: u64,
-) -> Result<GitJob, Box<dyn Error>> {
+) -> Result<PreparedJob, Box<dyn Error>> {
     Ok(match (carrier, epoch) {
-        (CommitCarrier::Header, 0) => GitJob::header(payload, target)?,
-        (CommitCarrier::Header, epoch) => GitJob::header_epoch(payload, target, epoch)?,
-        (CommitCarrier::Trailer, 0) => GitJob::message_trailer(payload, target)?,
-        (CommitCarrier::Trailer, epoch) => GitJob::message_trailer_epoch(payload, target, epoch)?,
+        (CommitCarrier::Header, 0) => {
+            PreparedJob::Printable(PrintableHeaderJob::header(payload, target)?)
+        }
+        (CommitCarrier::Header, epoch) => {
+            PreparedJob::Printable(PrintableHeaderJob::header_epoch(payload, target, epoch)?)
+        }
+        (CommitCarrier::Trailer, 0) => PreparedJob::Raw(GitJob::message_trailer(payload, target)?),
+        (CommitCarrier::Trailer, epoch) => {
+            PreparedJob::Raw(GitJob::message_trailer_epoch(payload, target, epoch)?)
+        }
     })
 }
 
@@ -268,28 +340,22 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
     let started = Instant::now();
     let mut last_progress = started;
-    let mut outer_base = 0;
+    let mut search_base = 0;
     let mut total_hashed = 0_u64;
     let expected_hashes = 2.0_f64.powi(target.bits() as i32) / args.carrier.eligible_fraction();
     let candidate = loop {
-        let outer_count = DEFAULT_OUTER_BATCH.min(OUTER_DOMAIN - outer_base);
-        let result = context.search(outer_base, outer_count)?;
+        let search_count = job.batch_size().min(job.domain_size() - search_base);
+        let result = job.search(&mut context, search_base, search_count)?;
         if let Some(candidate) = result.candidate {
             break candidate;
         }
         total_hashed = total_hashed.saturating_add(result.candidates_hashed);
-        outer_base += outer_count;
-        if outer_base == OUTER_DOMAIN {
+        search_base += search_count;
+        if search_base == job.domain_size() {
             epoch = epoch.checked_add(1).ok_or("nonce epoch overflow")?;
             job = prepare_job(&payload, target, args.carrier, epoch)?;
-            job.configure_context_with_policy(
-                &mut context,
-                match args.carrier {
-                    CommitCarrier::Header => git_sha1_cuda::NoncePolicy::HeaderSafe,
-                    CommitCarrier::Trailer => git_sha1_cuda::NoncePolicy::NoNul,
-                },
-            )?;
-            outer_base = 0;
+            job.configure_context(&mut context)?;
+            search_base = 0;
             eprintln!("  continuing with nonce epoch {epoch}");
         }
         if last_progress.elapsed() >= Duration::from_secs(1) {

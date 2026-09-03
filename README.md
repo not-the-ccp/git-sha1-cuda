@@ -61,9 +61,9 @@ The command uses:
 - the time at which the command starts;
 - the first available matching candidate from the GPU search.
 
-The nonce is stored in a custom `x` commit header. It does not appear in the
-commit subject or body, although it remains available in the raw commit object
-shown by `git cat-file commit <id>`.
+The default nonce is eight printable characters stored in a custom `x` commit
+header. It does not appear in the commit subject or body, although it remains
+available in the raw commit object shown by `git cat-file commit <id>`.
 
 Version 0.1 supports SHA-1 repositories, one-parent commits, `-m` messages, and
 the current index. Git commit hooks are outside this workflow. An unchanged
@@ -75,26 +75,32 @@ would have appeared after the work completed so far.
 
 ## Search time
 
-Measurements on a GeForce RTX 4060 with CUDA 13.3 reached approximately
-5.4 billion candidates per second for the custom-header layout used by the
-CLI. Header-safe candidate filtering is included in the estimates below.
+Measurements on a GeForce RTX 4060 with CUDA 13.3:
+
+| Carrier | Nonce representation | Message visibility | Throughput |
+|---|---|---|---:|
+| Printable header | Eight characters from ASCII `0x20..0x3f` | Hidden | 5.05 GH/s |
+| Raw header API | Five header-safe bytes | Hidden | 5.4 GH/s |
+| Message trailer | Five NUL-free bytes | Visible | 10.9 GH/s |
+
+The printable header is the CLI default. It has a complete 40-bit candidate
+space without rejected byte strings and is only about 7% slower than the raw
+header kernel.
 
 | Leading hex digits | Average time | 95% complete by |
 |---:|---:|---:|
-| 6 | 3.2 ms | 9.5 ms |
-| 7 | 52 ms | 0.16 s |
-| 8 | 0.83 s | 2.5 s |
-| 9 | 13 s | 40 s |
-| 10 | 3 min 32 s | 10 min 36 s |
+| 6 | 3.3 ms | 10 ms |
+| 7 | 53 ms | 0.16 s |
+| 8 | 0.85 s | 2.6 s |
+| 9 | 14 s | 41 s |
+| 10 | 3 min 38 s | 10 min 53 s |
 
 Search time follows a geometric distribution. The median is about 69% of the
 average, so individual runs vary considerably.
 
-The message-trailer layout available through the library searches about
-10.9 billion candidates per second because its mutable block is the final
-SHA-1 block. Its nonce is part of the commit message. The custom-header layout
-typically evaluates one additional fixed block per candidate to keep the nonce
-outside the message.
+The message trailer is faster because its mutable block is the final SHA-1
+block. A custom header typically evaluates one additional fixed block per
+candidate to keep the nonce outside the message.
 
 ## Build from source
 
@@ -135,15 +141,16 @@ verifies results with an independent SHA-1 implementation, and exposes the
 CUDA context through safe Rust types.
 
 ```rust,no_run
-use git_sha1_cuda::{GitJob, TargetPrefix};
+use git_sha1_cuda::{PrintableHeaderJob, TargetPrefix};
 
 # fn search(commit_payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
 let target = TargetPrefix::from_hex("01234567")?;
-let prepared = GitJob::header(commit_payload, target)?;
+let prepared = PrintableHeaderJob::header(commit_payload, target)?;
 let mut context = prepared.create_context(0)?;
 
-for outer_base in (0..1_u64 << 32).step_by(1 << 22) {
-    let result = context.search(outer_base, 1 << 22)?;
+for candidate_base in (0..1_u64 << 40).step_by(1 << 30) {
+    let count = (1_u64 << 30).min((1_u64 << 40) - candidate_base);
+    let result = context.search_masked_header(candidate_base, count)?;
     if let Some(candidate) = result.candidate {
         prepared.verify_candidate(candidate)?;
         let payload = prepared.materialize_payload(candidate)?;
@@ -165,9 +172,9 @@ Its reusable contexts support target prefixes from 1 to 160 bits, bounded
 search batches, full digest capture, runtime job replacement, custom-header
 suffix blocks, and selectable nonce-byte policies.
 
-An outer batch of `2^22` covers 1,073,741,824 candidates. This takes about
-0.20 seconds for a typical custom-header job on the measured RTX 4060, keeping
-launch and transfer overhead small while allowing regular progress updates.
+A printable-header batch of `2^30` covers 1,073,741,824 candidates. This takes
+about 0.21 seconds on the measured RTX 4060, keeping launch and transfer
+overhead small while allowing regular progress updates.
 
 The Python job generator provides an independent preparation and verification
 path:

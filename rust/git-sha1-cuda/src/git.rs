@@ -5,6 +5,8 @@ use crate::{sha1, Context, CudaError, Job, NoncePolicy};
 const NONCE_BYTES: usize = 5;
 const NONCE_BITS: u32 = 40;
 const NONCE_BLOCK_OFFSET: usize = 48;
+const PRINTABLE_NONCE_BYTES: usize = 8;
+const PRINTABLE_NONCE_BLOCK_OFFSET: usize = 44;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparationError(String);
@@ -466,12 +468,197 @@ impl GitJob {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PrintableHeaderJob {
+    source_payload: Vec<u8>,
+    payload_template: Vec<u8>,
+    object_template: Vec<u8>,
+    nonce_payload_offset: usize,
+    nonce_object_offset: usize,
+    mutable_block: usize,
+    filler_bytes: usize,
+    mutable_block_template: [u8; 64],
+    suffix_words: Vec<[u32; 16]>,
+    prestate: [u32; 5],
+    target: TargetPrefix,
+}
+
+impl PrintableHeaderJob {
+    pub fn header(payload: &[u8], target: TargetPrefix) -> Result<Self, PreparationError> {
+        Self::header_with_value_prefix(payload, target, b"")
+    }
+
+    pub fn header_epoch(
+        payload: &[u8],
+        target: TargetPrefix,
+        epoch: u64,
+    ) -> Result<Self, PreparationError> {
+        let value_prefix = format!("{epoch:016x} ");
+        Self::header_with_value_prefix(payload, target, value_prefix.as_bytes())
+    }
+
+    fn header_with_value_prefix(
+        payload: &[u8],
+        target: TargetPrefix,
+        value_prefix: &[u8],
+    ) -> Result<Self, PreparationError> {
+        let separator = payload
+            .windows(2)
+            .position(|bytes| bytes == b"\n\n")
+            .ok_or_else(|| {
+                PreparationError::new("commit payload has no blank line before its message")
+            })?;
+        let headers = &payload[..separator];
+        let message = &payload[separator + 2..];
+        let mut prefix = Vec::with_capacity(headers.len() + value_prefix.len() + 3);
+        prefix.extend_from_slice(headers);
+        prefix.extend_from_slice(b"\nx ");
+        prefix.extend_from_slice(value_prefix);
+
+        for filler_bytes in 0..4096 {
+            let nonce_payload_offset = prefix.len() + filler_bytes;
+            let mut payload_template =
+                Vec::with_capacity(prefix.len() + filler_bytes + 10 + message.len());
+            payload_template.extend_from_slice(&prefix);
+            payload_template.resize(payload_template.len() + filler_bytes, b' ');
+            payload_template.extend_from_slice(b"PPPPPPPP\n\n");
+            payload_template.extend_from_slice(message);
+
+            let object_template = serialize_commit(&payload_template);
+            let object_header_bytes = object_template.len() - payload_template.len();
+            let nonce_object_offset = object_header_bytes + nonce_payload_offset;
+            if nonce_object_offset % 64 != PRINTABLE_NONCE_BLOCK_OFFSET {
+                continue;
+            }
+            let padded = sha1::pad(&object_template);
+            let mutable_block = nonce_object_offset / 64;
+            let mutable_start = mutable_block * 64;
+            let suffix_start = mutable_start + 64;
+            let mut mutable_block_template: [u8; 64] = padded[mutable_start..suffix_start]
+                .try_into()
+                .expect("one complete mutable block");
+            mutable_block_template[PRINTABLE_NONCE_BLOCK_OFFSET
+                ..PRINTABLE_NONCE_BLOCK_OFFSET + PRINTABLE_NONCE_BYTES]
+                .fill(0);
+            let suffix_words = padded[suffix_start..]
+                .chunks_exact(64)
+                .map(sha1::block_words)
+                .collect();
+            return Ok(Self {
+                source_payload: payload.to_vec(),
+                payload_template,
+                object_template,
+                nonce_payload_offset,
+                nonce_object_offset,
+                mutable_block,
+                filler_bytes,
+                mutable_block_template,
+                suffix_words,
+                prestate: sha1::prestate(&padded, mutable_block),
+                target,
+            });
+        }
+        Err(PreparationError::new(
+            "could not align the printable custom-header nonce within 4096 filler bytes",
+        ))
+    }
+
+    pub fn source_payload(&self) -> &[u8] {
+        &self.source_payload
+    }
+
+    pub fn payload_template(&self) -> &[u8] {
+        &self.payload_template
+    }
+
+    pub fn object_template(&self) -> &[u8] {
+        &self.object_template
+    }
+
+    pub fn nonce_payload_offset(&self) -> usize {
+        self.nonce_payload_offset
+    }
+
+    pub fn nonce_object_offset(&self) -> usize {
+        self.nonce_object_offset
+    }
+
+    pub fn mutable_block(&self) -> usize {
+        self.mutable_block
+    }
+
+    pub fn filler_bytes(&self) -> usize {
+        self.filler_bytes
+    }
+
+    pub fn suffix_blocks(&self) -> usize {
+        self.suffix_words.len()
+    }
+
+    pub fn target(&self) -> TargetPrefix {
+        self.target
+    }
+
+    pub fn create_context(&self, device: i32) -> Result<Context, CudaError> {
+        let seed = Job::new(&sha1::IV, &[0; 16], self.target.bits, &self.target.words)?;
+        let mut context = Context::new(device, &seed)?;
+        self.configure_context(&mut context)?;
+        Ok(context)
+    }
+
+    pub fn configure_context(&self, context: &mut Context) -> Result<(), CudaError> {
+        context.set_masked_header_job(
+            &self.prestate,
+            &sha1::block_words(&self.mutable_block_template),
+            self.target.bits,
+            &self.target.words,
+            &self.suffix_words,
+        )
+    }
+
+    pub fn materialize_payload(&self, candidate: u64) -> Result<Vec<u8>, PreparationError> {
+        let nonce = printable_candidate_bytes(candidate)?;
+        let mut payload = self.payload_template.clone();
+        payload[self.nonce_payload_offset..self.nonce_payload_offset + PRINTABLE_NONCE_BYTES]
+            .copy_from_slice(&nonce);
+        Ok(payload)
+    }
+
+    pub fn materialize_object(&self, candidate: u64) -> Result<Vec<u8>, PreparationError> {
+        Ok(serialize_commit(&self.materialize_payload(candidate)?))
+    }
+
+    pub fn digest(&self, candidate: u64) -> Result<[u8; 20], PreparationError> {
+        Ok(sha1::digest(&self.materialize_object(candidate)?))
+    }
+
+    pub fn verify_candidate(&self, candidate: u64) -> Result<[u8; 20], PreparationError> {
+        let digest = self.digest(candidate)?;
+        if !self.target.matches(&digest) {
+            return Err(PreparationError::new(
+                "candidate digest does not match the requested target prefix",
+            ));
+        }
+        Ok(digest)
+    }
+}
+
 fn candidate_bytes(candidate: u64) -> Result<[u8; 5], PreparationError> {
     if candidate >= (1_u64 << NONCE_BITS) {
         return Err(PreparationError::new("candidate must fit in 40 bits"));
     }
     let bytes = candidate.to_be_bytes();
     Ok(bytes[3..].try_into().unwrap())
+}
+
+fn printable_candidate_bytes(candidate: u64) -> Result<[u8; 8], PreparationError> {
+    if candidate >= (1_u64 << NONCE_BITS) {
+        return Err(PreparationError::new("candidate must fit in 40 bits"));
+    }
+    Ok(std::array::from_fn(|index| {
+        let shift = 35 - index * 5;
+        0x20 | ((candidate >> shift) as u8 & 0x1f)
+    }))
 }
 
 fn serialize_commit(payload: &[u8]) -> Vec<u8> {
@@ -484,7 +671,7 @@ fn serialize_commit(payload: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Carrier, GitJob, TargetPrefix};
+    use super::{printable_candidate_bytes, Carrier, GitJob, PrintableHeaderJob, TargetPrefix};
     use crate::device_count;
 
     const COMMIT: &[u8] = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
@@ -530,6 +717,46 @@ visible subject\n";
         assert_eq!(job.carrier(), Carrier::MessageTrailer);
         assert_eq!(job.nonce_object_offset() % 64, 48);
         assert_eq!(job.suffix_blocks(), 0);
+    }
+
+    #[test]
+    fn printable_header_layout_matches_cross_language_fixture() {
+        let target = TargetPrefix::from_hex("894dbe83f20d4815fde83abb8582b2cc7b4b696c").unwrap();
+        let job = PrintableHeaderJob::header(COMMIT, target).unwrap();
+        assert_eq!(job.nonce_object_offset() % 64, 44);
+        assert_eq!(job.suffix_blocks(), 1);
+        assert_eq!(job.filler_bytes(), 36);
+        assert_eq!(printable_candidate_bytes(0).unwrap(), *b"        ");
+        assert_eq!(
+            printable_candidate_bytes((1_u64 << 40) - 1).unwrap(),
+            *b"????????"
+        );
+        assert_eq!(
+            printable_candidate_bytes(0x1234_5678_9a).unwrap(),
+            *b"\"(:%,>$:"
+        );
+        assert_eq!(
+            job.verify_candidate(0x1234_5678_9a).unwrap(),
+            target.aligned_bytes()
+        );
+    }
+
+    #[test]
+    fn cuda_printable_header_digest_matches_cpu() {
+        if !matches!(device_count(), Ok(count) if count > 0) {
+            return;
+        }
+        let target = TargetPrefix::from_hex("894dbe83f20d4815fde83abb8582b2cc7b4b696c").unwrap();
+        let job = PrintableHeaderJob::header(COMMIT, target).unwrap();
+        let mut context = job.create_context(0).unwrap();
+        let words = context.digest_masked_header(0x1234_5678_9a).unwrap();
+        let mut digest = [0; 20];
+        for (bytes, word) in digest.chunks_exact_mut(4).zip(words) {
+            bytes.copy_from_slice(&word.to_be_bytes());
+        }
+        assert_eq!(digest, job.digest(0x1234_5678_9a).unwrap());
+        let result = context.search_masked_header(0x1234_5678_9a, 1).unwrap();
+        assert_eq!(result.candidate, Some(0x1234_5678_9a));
     }
 
     #[test]
